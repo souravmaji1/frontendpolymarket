@@ -96,51 +96,27 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
     }
   }
 
-  function trySel(assetId, ask) {
-    const pos = positions[assetId]
-    if (!pos || !ask || ask <= 0) return
-    if (ask > pos.peakAsk) pos.peakAsk = ask
-    const peakDrop = pos.peakAsk - ask
-    let shouldSell = false, sellReason = ''
-    if (ask < pos.buyAsk) { shouldSell = true; sellReason = `Stop-loss: bought@${(pos.buyAsk*100).toFixed(1)}¢ now@${(ask*100).toFixed(1)}¢` }
-    if (!shouldSell && ask >= config.sellZoneLow && ask <= config.sellZoneHigh) { shouldSell = true; sellReason = `Target zone: ask@${(ask*100).toFixed(1)}¢` }
-    if (!shouldSell && pos.peakAsk > config.sellZoneHigh && ask < config.sellZoneLow) { shouldSell = true; sellReason = `Dropped below ${(config.sellZoneLow*100)}¢ after peak@${(pos.peakAsk*100).toFixed(1)}¢` }
-    if (!shouldSell && pos.peakAsk > pos.buyAsk && peakDrop >= config.peakDropCents) { shouldSell = true; sellReason = `Trailing stop: peak@${(pos.peakAsk*100).toFixed(1)}¢ → now@${(ask*100).toFixed(1)}¢` }
-    if (!shouldSell) return
-    const proceeds = pos.shares * ask
-    const cost = pos.shares * pos.buyAsk
-    const pnl = proceeds - cost
-    paperBalance += proceeds
-    lastSellTime[assetId] = Date.now()
-    const entry = { type: 'SELL', outcome: pos.outcomeName, shares: pos.shares, buyAsk: (pos.buyAsk*100).toFixed(1), sellAsk: (ask*100).toFixed(1), peakAsk: (pos.peakAsk*100).toFixed(1), pnl: pnl.toFixed(2), reason: sellReason, balanceAfter: paperBalance.toFixed(2), time: new Date().toLocaleTimeString(), assetId }
-    tradeLog.push(entry)
-    delete positions[assetId]
-    onTrade(entry, paperBalance, positions)
-    const icon = pnl >= 0 ? 'SELL WIN' : 'SELL LOSS'
-    onLog(`${icon} ${pos.outcomeName} | ${(pos.buyAsk*100).toFixed(1)}¢→${(ask*100).toFixed(1)}¢ | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} | ${sellReason}`, pnl >= 0 ? 'sell_win' : 'sell_loss')
-  }
-
   function trySell(assetId, ask) {
     const pos = positions[assetId]
     if (!pos || !ask || ask <= 0) return
     if (ask > pos.peakAsk) pos.peakAsk = ask
-    
+
     let shouldSell = false, sellReason = ''
-    
-    // Only stop-loss: price dropped below what we paid
+
+    // Stop-loss: price has fallen below what we paid
     if (ask < pos.buyAsk) {
       shouldSell = true
       sellReason = `Stop-loss: bought@${(pos.buyAsk*100).toFixed(1)}¢ now@${(ask*100).toFixed(1)}¢`
     }
-    
-    // Or we've hit the sell target zone
+
+    // Take-profit: price has reached the configured sell target zone
     if (!shouldSell && ask >= config.sellZoneLow && ask <= config.sellZoneHigh) {
       shouldSell = true
       sellReason = `Target zone: ask@${(ask*100).toFixed(1)}¢`
     }
-    
+
     if (!shouldSell) return
-    
+
     const proceeds = pos.shares * ask
     const cost = pos.shares * pos.buyAsk
     const pnl = proceeds - cost
@@ -161,9 +137,19 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
     const mid = rawMid > 0 ? rawMid : (bid + ask) / 2
     if (bid > 0) lastBid[assetId] = bid
     if (ask > 0) lastAsk[assetId] = ask
+
+    // Snapshot whether we had a position BEFORE this tick
+    const hadPositionBefore = !!positions[assetId]
+
     onTick({ assetId, outcomeName, ask, bid, mid, prevAsk, source, positions: { ...positions }, balance: paperBalance })
     tryBuy(assetId, outcomeName, ask)
-    trySell(assetId, ask)
+
+    // Only try to sell if we already held a position before this tick arrived.
+    // This prevents an immediate stop-loss firing on the same tick we just bought,
+    // which happened when WS sent best_ask=0 causing a stale price fallback.
+    if (hadPositionBefore) {
+      trySell(assetId, ask)
+    }
   }
 
   function connectWebSocket() {
@@ -203,7 +189,7 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
       setTimeout(connectWebSocket, 4000)
     }
 
-    ws.onerror = (err) => {
+    ws.onerror = () => {
       onLog(`WebSocket error — falling back to polling`, 'info')
     }
   }
@@ -229,57 +215,51 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
     }, 5000)
   }
 
- async function init() {
-  onLog(`Fetching market data for slug: ${slug}`, 'info')
-  try {
-    const res = await fetch(`https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(slug)}`)
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const data = await res.json()
-    const market = data[0]
-    if (!market) throw new Error('Market not found for that slug')
+  async function init() {
+    onLog(`Fetching market data for slug: ${slug}`, 'info')
+    try {
+      const res = await fetch(`https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(slug)}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      const market = data[0]
+      if (!market) throw new Error('Market not found for that slug')
 
-    // Safe parse helper — handles both already-array and JSON-string cases
-    const safeParse = (val) => {
-      if (Array.isArray(val)) return val
-      if (typeof val === 'string') {
-        try { return JSON.parse(val) } catch { return [] }
+      const safeParse = (val) => {
+        if (Array.isArray(val)) return val
+        if (typeof val === 'string') {
+          try { return JSON.parse(val) } catch { return [] }
+        }
+        return []
       }
-      return []
+
+      clobTokenIds = safeParse(market.clobTokenIds)
+      const prices = safeParse(market.outcomePrices)
+      const outcomes = safeParse(market.outcomes)
+
+      if (clobTokenIds.length === 0) throw new Error('No CLOB token IDs found for this market')
+
+      clobTokenIds.forEach((id, i) => {
+        tokenToOutcome[id] = outcomes[i] || `Outcome ${i + 1}`
+        lastAsk[id] = parseFloat(prices[i] || 0)
+        lastBid[id] = 0
+        lastSellTime[id] = 0
+      })
+
+      onMarketLoaded({ question: market.question, outcomes, slug, clobTokenIds })
+
+      onLog(`Market: ${market.question}`, 'info')
+      onLog(`Outcomes: ${outcomes.join(' vs ')}`, 'info')
+      onLog(`Assets: ${clobTokenIds.length} token(s) found`, 'info')
+      onLog(`Initial prices: ${prices.map((p, i) => `${outcomes[i] || i}: ${(parseFloat(p)*100).toFixed(1)}¢`).join(' | ')}`, 'info')
+      onLog(`Strategy: BUY ${(config.buyZoneLow*100)}–${(config.buyZoneHigh*100)}¢ | SELL ${(config.sellZoneLow*100)}–${(config.sellZoneHigh*100)}¢`, 'info')
+      onLog(`Starting balance: $${config.paperBalance}`, 'info')
+
+      connectWebSocket()
+      startPolling()
+    } catch (err) {
+      onLog(`Error: ${err.message}`, 'info')
     }
-
-    clobTokenIds = safeParse(market.clobTokenIds)
-    const prices  = safeParse(market.outcomePrices)
-    const outcomes = safeParse(market.outcomes)
-
-    if (clobTokenIds.length === 0) throw new Error('No CLOB token IDs found for this market')
-
-    clobTokenIds.forEach((id, i) => {
-      tokenToOutcome[id] = outcomes[i] || `Outcome ${i + 1}`
-      lastAsk[id] = parseFloat(prices[i] || 0)
-      lastBid[id] = 0
-      lastSellTime[id] = 0
-    })
-
-    onMarketLoaded({
-      question: market.question,
-      outcomes,
-      slug,
-      clobTokenIds,
-    })
-
-    onLog(`Market: ${market.question}`, 'info')
-    onLog(`Outcomes: ${outcomes.join(' vs ')}`, 'info')
-    onLog(`Assets: ${clobTokenIds.length} token(s) found`, 'info')
-    onLog(`Initial prices: ${prices.map((p, i) => `${outcomes[i] || i}: ${(parseFloat(p)*100).toFixed(1)}¢`).join(' | ')}`, 'info')
-    onLog(`Strategy: BUY ${(config.buyZoneLow*100)}–${(config.buyZoneHigh*100)}¢ | SELL ${(config.sellZoneLow*100)}–${(config.sellZoneHigh*100)}¢`, 'info')
-    onLog(`Starting balance: $${config.paperBalance}`, 'info')
-
-    connectWebSocket()
-    startPolling()
-  } catch (err) {
-    onLog(`Error: ${err.message}`, 'info')
   }
-}
 
   init()
 
@@ -315,7 +295,7 @@ function Navbar({ botRunning }) {
 }
 
 function Ticker() {
-  const items = ['Live CLOB WebSocket', 'Real Ask Prices', 'Polymarket Feed', 'Trailing Stop', 'Take Profit', 'Stop Loss', 'Paper Trading', 'Gamma API', 'Real-time Monitor']
+  const items = ['Live CLOB WebSocket', 'Real Ask Prices', 'Polymarket Feed', 'Stop Loss Only', 'Take Profit Zone', 'Hold Through Dips', 'Paper Trading', 'Gamma API', 'Real-time Monitor']
   return (
     <div className="ticker-wrap">
       <div className="ticker-inner">
@@ -332,7 +312,6 @@ function ConfigPanel({ config, setConfig, disabled }) {
     { key: 'buyZoneHigh', label: 'Buy Zone High (¢)', min: 1, max: 99, step: 1, display: v => Math.round(v * 100), parse: v => v / 100, format: v => `${Math.round(v*100)}¢` },
     { key: 'sellZoneLow', label: 'Sell Zone Low (¢)', min: 1, max: 99, step: 1, display: v => Math.round(v * 100), parse: v => v / 100, format: v => `${Math.round(v*100)}¢` },
     { key: 'sellZoneHigh', label: 'Sell Zone High (¢)', min: 1, max: 99, step: 1, display: v => Math.round(v * 100), parse: v => v / 100, format: v => `${Math.round(v*100)}¢` },
-    { key: 'peakDropCents', label: 'Trailing Drop (¢)', min: 1, max: 10, step: 1, display: v => Math.round(v * 100), parse: v => v / 100, format: v => `${Math.round(v*100)}¢` },
   ]
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.2rem' }}>
@@ -358,6 +337,12 @@ function ConfigPanel({ config, setConfig, disabled }) {
           </div>
         )
       })}
+      <div style={{ padding: '0.75rem', background: 'rgba(232,255,71,0.04)', border: '1px solid rgba(232,255,71,0.1)' }}>
+        <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.55rem', color: '#e8ff47', letterSpacing: '0.1em', marginBottom: '0.3rem' }}>HOLD LOGIC</div>
+        <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.58rem', color: '#6b6b8a', lineHeight: 1.6 }}>
+          Holds through all dips above buy price. Sell only triggers at target zone or if price falls below buy price.
+        </div>
+      </div>
     </div>
   )
 }
@@ -582,9 +567,7 @@ export default function Page() {
 
   const assetIds = marketInfo?.clobTokenIds || []
   const outcomes = marketInfo?.outcomes || []
-
   const activeSource = Object.values(wsSources)[0] || '—'
-  const tickCount = Object.keys(ticks).length
 
   return (
     <>
@@ -666,7 +649,6 @@ export default function Page() {
           <section style={{ padding: '2rem 4rem 4rem' }}>
             <div style={{ maxWidth: '1400px', margin: '0 auto' }}>
 
-              {/* Market header */}
               {marketInfo && (
                 <div style={{ marginBottom: '1.5rem', padding: '1rem 1.5rem', background: '#111118', border: '1px solid rgba(232,255,71,0.12)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '1rem' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
@@ -692,7 +674,6 @@ export default function Page() {
                 </div>
               )}
 
-              {/* Stats row */}
               <div className="stats-row" style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '1px', background: 'rgba(240,240,248,0.07)', marginBottom: '1.5rem' }}>
                 {[
                   { label: 'Cash Balance', value: `$${balance.toFixed(2)}`, color: '#f0f0f8', sub: `Started $${config.paperBalance}` },
@@ -710,7 +691,6 @@ export default function Page() {
                 ))}
               </div>
 
-              {/* Outcome cards */}
               {assetIds.length > 0 && (
                 <div className="outcomes-row" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1px', background: 'rgba(240,240,248,0.07)', marginBottom: '1.5rem' }}>
                   {assetIds.map((id, i) => {
@@ -736,7 +716,6 @@ export default function Page() {
                 </div>
               )}
 
-              {/* Sparklines */}
               {assetIds.length > 0 && (
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1px', background: 'rgba(240,240,248,0.07)', marginBottom: '1.5rem' }}>
                   {[
@@ -757,9 +736,7 @@ export default function Page() {
                 </div>
               )}
 
-              {/* Trades + Console */}
               <div className="dashboard-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
-
                 <div className="card-dark" style={{ overflow: 'hidden' }}>
                   <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid rgba(240,240,248,0.07)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#111118' }}>
                     <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.62rem', color: '#e8ff47', letterSpacing: '0.18em', textTransform: 'uppercase', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
@@ -817,7 +794,6 @@ export default function Page() {
                 </div>
               </div>
 
-              {/* Strategy reference */}
               <div style={{ marginTop: '1.5rem', padding: '1.25rem 1.5rem', background: '#111118', border: '1px solid rgba(240,240,248,0.07)' }}>
                 <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.6rem', color: '#e8ff47', letterSpacing: '0.18em', textTransform: 'uppercase', marginBottom: '0.75rem' }}>Active Strategy</div>
                 <div style={{ display: 'flex', gap: '2rem', flexWrap: 'wrap' }}>
@@ -825,7 +801,7 @@ export default function Page() {
                     { icon: '🟢', label: 'BUY Zone', value: `${Math.round(config.buyZoneLow*100)}–${Math.round(config.buyZoneHigh*100)}¢ ask`, color: '#47d4ff' },
                     { icon: '✅', label: 'SELL Target', value: `${Math.round(config.sellZoneLow*100)}–${Math.round(config.sellZoneHigh*100)}¢ ask`, color: '#e8ff47' },
                     { icon: '🔴', label: 'Stop-Loss', value: 'Below buy price', color: '#ff4766' },
-                    { icon: '📉', label: 'Trailing Stop', value: `${Math.round(config.peakDropCents*100)}¢ drop from peak`, color: '#a78bfa' },
+                    { icon: '📌', label: 'Hold Logic', value: 'Holds through all dips above buy price', color: '#a78bfa' },
                     { icon: '💰', label: 'Starting Balance', value: `$${config.paperBalance}`, color: '#f0f0f8' },
                   ].map(s => (
                     <div key={s.label} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
@@ -842,7 +818,6 @@ export default function Page() {
           </section>
         )}
 
-        {/* IDLE STATE */}
         {!botRunning && trades.length === 0 && logs.length === 0 && (
           <section style={{ padding: '4rem 4rem 6rem', textAlign: 'center' }}>
             <div style={{ maxWidth: '600px', margin: '0 auto' }}>
@@ -864,8 +839,9 @@ export default function Page() {
                   'Fetches market from gamma-api.polymarket.com',
                   'Connects to wss://ws-subscriptions-clob.polymarket.com',
                   'Polls clob.polymarket.com/price every 5s as backup',
-                  'Executes paper trades on real ask/bid prices',
-                  'Tracks P&L and unrealized gains live',
+                  'Buys when ask enters your configured buy zone',
+                  'Holds through all price swings above buy price',
+                  'Sells only at target zone or below buy price (stop-loss)',
                 ].map(item => (
                   <div key={item} style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', fontFamily: "'Space Mono', monospace", fontSize: '0.65rem', color: '#6b6b8a', letterSpacing: '0.05em' }}>
                     <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#e8ff47" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
