@@ -54,10 +54,6 @@ function InjectStyles() {
       .status-stopped { background: #ff4766; }
       .status-idle { background: #2a2a3a; }
       .outcome-card { padding: 1.5rem; transition: all 0.3s; position: relative; overflow: hidden; }
-      .toggle-pill { display: flex; background: #0a0a0f; border: 1px solid rgba(240,240,248,0.12); border-radius: 4px; overflow: hidden; }
-      .toggle-pill button { flex: 1; padding: 0.5rem 0.75rem; font-family: 'Space Mono', monospace; font-size: 0.6rem; letter-spacing: 0.1em; text-transform: uppercase; border: none; cursor: pointer; transition: all 0.2s; background: transparent; color: #6b6b8a; }
-      .toggle-pill button.active { background: #e8ff47; color: #0a0a0f; font-weight: 700; }
-      .toggle-pill button:disabled { cursor: not-allowed; opacity: 0.4; }
       @media (max-width: 768px) { .dashboard-grid { grid-template-columns: 1fr !important; } .stats-row { grid-template-columns: 1fr 1fr !important; } .outcomes-row { grid-template-columns: 1fr !important; } .hero-pad { padding: 0 1.5rem !important; } }
     `
     const style = document.createElement('style')
@@ -82,9 +78,6 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
   let tokenToOutcome = {}
   let clobTokenIds = []
 
-  // exitStrategy: 'sell' = sell immediately on drop below buy zone
-  //               'hold' = hold until price reaches sell zone or re-enters buy zone
-
   function tryBuy(assetId, outcomeName, ask) {
     if (positions[assetId]) return
     if (!ask || ask <= 0) return
@@ -95,13 +88,7 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
       if (shares <= 0 || paperBalance < shares * ask) return
       const cost = shares * ask
       paperBalance -= cost
-      positions[assetId] = {
-        shares,
-        buyAsk: ask,
-        outcomeName,
-        peakAsk: ask,
-        exitedBuyZone: false,   // tracks whether price ever left the buy zone upward
-      }
+      positions[assetId] = { shares, buyAsk: ask, outcomeName, peakAsk: ask }
       const entry = { type: 'BUY', outcome: outcomeName, shares, askPrice: (ask * 100).toFixed(1), cost: cost.toFixed(2), balanceAfter: paperBalance.toFixed(2), time: new Date().toLocaleTimeString(), assetId }
       tradeLog.push(entry)
       onTrade(entry, paperBalance, positions)
@@ -109,73 +96,51 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
     }
   }
 
+  function trySel(assetId, ask) {
+    const pos = positions[assetId]
+    if (!pos || !ask || ask <= 0) return
+    if (ask > pos.peakAsk) pos.peakAsk = ask
+    const peakDrop = pos.peakAsk - ask
+    let shouldSell = false, sellReason = ''
+    if (ask < pos.buyAsk) { shouldSell = true; sellReason = `Stop-loss: bought@${(pos.buyAsk*100).toFixed(1)}¢ now@${(ask*100).toFixed(1)}¢` }
+    if (!shouldSell && ask >= config.sellZoneLow && ask <= config.sellZoneHigh) { shouldSell = true; sellReason = `Target zone: ask@${(ask*100).toFixed(1)}¢` }
+    if (!shouldSell && pos.peakAsk > config.sellZoneHigh && ask < config.sellZoneLow) { shouldSell = true; sellReason = `Dropped below ${(config.sellZoneLow*100)}¢ after peak@${(pos.peakAsk*100).toFixed(1)}¢` }
+    if (!shouldSell && pos.peakAsk > pos.buyAsk && peakDrop >= config.peakDropCents) { shouldSell = true; sellReason = `Trailing stop: peak@${(pos.peakAsk*100).toFixed(1)}¢ → now@${(ask*100).toFixed(1)}¢` }
+    if (!shouldSell) return
+    const proceeds = pos.shares * ask
+    const cost = pos.shares * pos.buyAsk
+    const pnl = proceeds - cost
+    paperBalance += proceeds
+    lastSellTime[assetId] = Date.now()
+    const entry = { type: 'SELL', outcome: pos.outcomeName, shares: pos.shares, buyAsk: (pos.buyAsk*100).toFixed(1), sellAsk: (ask*100).toFixed(1), peakAsk: (pos.peakAsk*100).toFixed(1), pnl: pnl.toFixed(2), reason: sellReason, balanceAfter: paperBalance.toFixed(2), time: new Date().toLocaleTimeString(), assetId }
+    tradeLog.push(entry)
+    delete positions[assetId]
+    onTrade(entry, paperBalance, positions)
+    const icon = pnl >= 0 ? 'SELL WIN' : 'SELL LOSS'
+    onLog(`${icon} ${pos.outcomeName} | ${(pos.buyAsk*100).toFixed(1)}¢→${(ask*100).toFixed(1)}¢ | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} | ${sellReason}`, pnl >= 0 ? 'sell_win' : 'sell_loss')
+  }
+
   function trySell(assetId, ask) {
     const pos = positions[assetId]
     if (!pos || !ask || ask <= 0) return
     if (ask > pos.peakAsk) pos.peakAsk = ask
-
-    // Detect when price moves above the buy zone (upward exit)
-    if (!pos.exitedBuyZone && ask > config.buyZoneHigh) {
-      pos.exitedBuyZone = true
-      onLog(`${pos.outcomeName} exited BUY zone upward @ ${(ask*100).toFixed(1)}¢ — watching for sell zone or drop`, 'info')
-    }
-
-    const peakDrop = pos.peakAsk - ask
-    let shouldSell = false
-    let sellReason = ''
-
-    // ── Standard stop-loss: price below buy price ──
+    
+    let shouldSell = false, sellReason = ''
+    
+    // Only stop-loss: price dropped below what we paid
     if (ask < pos.buyAsk) {
-      if (config.exitStrategy === 'sell') {
-        shouldSell = true
-        sellReason = `Stop-loss (sell mode): bought@${(pos.buyAsk*100).toFixed(1)}¢ now@${(ask*100).toFixed(1)}¢`
-      } else {
-        // hold mode: only sell on stop-loss if price is WELL below buy price (hard floor)
-        // Otherwise hold waiting to re-enter sell zone or buy zone recovery
-        onLog(`${pos.outcomeName} below buy price @ ${(ask*100).toFixed(1)}¢ — HOLDING (hold mode)`, 'info')
-      }
+      shouldSell = true
+      sellReason = `Stop-loss: bought@${(pos.buyAsk*100).toFixed(1)}¢ now@${(ask*100).toFixed(1)}¢`
     }
-
-    // ── Price dropped back into / below buy zone after exiting upward ──
-    if (!shouldSell && pos.exitedBuyZone && ask <= config.buyZoneHigh && ask >= config.buyZoneLow) {
-      if (config.exitStrategy === 'sell') {
-        shouldSell = true
-        sellReason = `Re-entered buy zone after exit (sell mode): ask@${(ask*100).toFixed(1)}¢`
-      } else {
-        onLog(`${pos.outcomeName} pulled back to buy zone @ ${(ask*100).toFixed(1)}¢ — HOLDING for sell zone (hold mode)`, 'info')
-      }
-    }
-
-    // ── Price dropped BELOW buy zone after exiting upward ──
-    if (!shouldSell && pos.exitedBuyZone && ask < config.buyZoneLow) {
-      if (config.exitStrategy === 'sell') {
-        shouldSell = true
-        sellReason = `Dropped below buy zone after exit (sell mode): ask@${(ask*100).toFixed(1)}¢`
-      } else {
-        onLog(`${pos.outcomeName} below buy zone @ ${(ask*100).toFixed(1)}¢ — HOLDING for recovery (hold mode)`, 'info')
-      }
-    }
-
-    // ── Sell zone hit (always sell regardless of strategy) ──
+    
+    // Or we've hit the sell target zone
     if (!shouldSell && ask >= config.sellZoneLow && ask <= config.sellZoneHigh) {
       shouldSell = true
       sellReason = `Target zone: ask@${(ask*100).toFixed(1)}¢`
     }
-
-    // ── Price overshot sell zone then dropped back below (always sell) ──
-    if (!shouldSell && pos.peakAsk > config.sellZoneHigh && ask < config.sellZoneLow) {
-      shouldSell = true
-      sellReason = `Dropped below ${(config.sellZoneLow*100)}¢ after peak@${(pos.peakAsk*100).toFixed(1)}¢`
-    }
-
-    // ── Trailing stop (always active regardless of strategy) ──
-    if (!shouldSell && pos.peakAsk > pos.buyAsk && peakDrop >= config.peakDropCents) {
-      shouldSell = true
-      sellReason = `Trailing stop: peak@${(pos.peakAsk*100).toFixed(1)}¢ → now@${(ask*100).toFixed(1)}¢`
-    }
-
+    
     if (!shouldSell) return
-
+    
     const proceeds = pos.shares * ask
     const cost = pos.shares * pos.buyAsk
     const pnl = proceeds - cost
@@ -238,7 +203,7 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
       setTimeout(connectWebSocket, 4000)
     }
 
-    ws.onerror = () => {
+    ws.onerror = (err) => {
       onLog(`WebSocket error — falling back to polling`, 'info')
     }
   }
@@ -264,52 +229,57 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
     }, 5000)
   }
 
-  async function init() {
-    onLog(`Fetching market data for slug: ${slug}`, 'info')
-    try {
-      const res = await fetch(`https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(slug)}`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      const market = data[0]
-      if (!market) throw new Error('Market not found for that slug')
+ async function init() {
+  onLog(`Fetching market data for slug: ${slug}`, 'info')
+  try {
+    const res = await fetch(`https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(slug)}`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    const market = data[0]
+    if (!market) throw new Error('Market not found for that slug')
 
-      const safeParse = (val) => {
-        if (Array.isArray(val)) return val
-        if (typeof val === 'string') {
-          try { return JSON.parse(val) } catch { return [] }
-        }
-        return []
+    // Safe parse helper — handles both already-array and JSON-string cases
+    const safeParse = (val) => {
+      if (Array.isArray(val)) return val
+      if (typeof val === 'string') {
+        try { return JSON.parse(val) } catch { return [] }
       }
-
-      clobTokenIds = safeParse(market.clobTokenIds)
-      const prices = safeParse(market.outcomePrices)
-      const outcomes = safeParse(market.outcomes)
-
-      if (clobTokenIds.length === 0) throw new Error('No CLOB token IDs found for this market')
-
-      clobTokenIds.forEach((id, i) => {
-        tokenToOutcome[id] = outcomes[i] || `Outcome ${i + 1}`
-        lastAsk[id] = parseFloat(prices[i] || 0)
-        lastBid[id] = 0
-        lastSellTime[id] = 0
-      })
-
-      onMarketLoaded({ question: market.question, outcomes, slug, clobTokenIds })
-
-      onLog(`Market: ${market.question}`, 'info')
-      onLog(`Outcomes: ${outcomes.join(' vs ')}`, 'info')
-      onLog(`Assets: ${clobTokenIds.length} token(s) found`, 'info')
-      onLog(`Initial prices: ${prices.map((p, i) => `${outcomes[i] || i}: ${(parseFloat(p)*100).toFixed(1)}¢`).join(' | ')}`, 'info')
-      onLog(`Strategy: BUY ${(config.buyZoneLow*100)}–${(config.buyZoneHigh*100)}¢ | SELL ${(config.sellZoneLow*100)}–${(config.sellZoneHigh*100)}¢`, 'info')
-      onLog(`Exit mode after buy zone: ${config.exitStrategy === 'sell' ? 'SELL IMMEDIATELY on drop' : 'HOLD until sell/buy zone'}`, 'info')
-      onLog(`Starting balance: $${config.paperBalance}`, 'info')
-
-      connectWebSocket()
-      startPolling()
-    } catch (err) {
-      onLog(`Error: ${err.message}`, 'info')
+      return []
     }
+
+    clobTokenIds = safeParse(market.clobTokenIds)
+    const prices  = safeParse(market.outcomePrices)
+    const outcomes = safeParse(market.outcomes)
+
+    if (clobTokenIds.length === 0) throw new Error('No CLOB token IDs found for this market')
+
+    clobTokenIds.forEach((id, i) => {
+      tokenToOutcome[id] = outcomes[i] || `Outcome ${i + 1}`
+      lastAsk[id] = parseFloat(prices[i] || 0)
+      lastBid[id] = 0
+      lastSellTime[id] = 0
+    })
+
+    onMarketLoaded({
+      question: market.question,
+      outcomes,
+      slug,
+      clobTokenIds,
+    })
+
+    onLog(`Market: ${market.question}`, 'info')
+    onLog(`Outcomes: ${outcomes.join(' vs ')}`, 'info')
+    onLog(`Assets: ${clobTokenIds.length} token(s) found`, 'info')
+    onLog(`Initial prices: ${prices.map((p, i) => `${outcomes[i] || i}: ${(parseFloat(p)*100).toFixed(1)}¢`).join(' | ')}`, 'info')
+    onLog(`Strategy: BUY ${(config.buyZoneLow*100)}–${(config.buyZoneHigh*100)}¢ | SELL ${(config.sellZoneLow*100)}–${(config.sellZoneHigh*100)}¢`, 'info')
+    onLog(`Starting balance: $${config.paperBalance}`, 'info')
+
+    connectWebSocket()
+    startPolling()
+  } catch (err) {
+    onLog(`Error: ${err.message}`, 'info')
   }
+}
 
   init()
 
@@ -355,40 +325,6 @@ function Ticker() {
   )
 }
 
-function ExitStrategyToggle({ value, onChange, disabled }) {
-  return (
-    <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
-        <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.65rem', color: '#6b6b8a', letterSpacing: '0.05em' }}>Exit after buy zone drop</span>
-        <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.65rem', color: '#e8ff47', fontWeight: 700 }}>{value === 'sell' ? 'Sell' : 'Hold'}</span>
-      </div>
-      <div className="toggle-pill">
-        <button
-          className={value === 'sell' ? 'active' : ''}
-          onClick={() => onChange('sell')}
-          disabled={disabled}
-          title="Sell immediately when price drops after leaving buy zone"
-        >
-          ✕ Sell on drop
-        </button>
-        <button
-          className={value === 'hold' ? 'active' : ''}
-          onClick={() => onChange('hold')}
-          disabled={disabled}
-          title="Hold until price reaches sell zone or re-enters buy zone"
-        >
-          ⏳ Hold for zone
-        </button>
-      </div>
-      <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.55rem', color: '#2a2a3a', letterSpacing: '0.05em', marginTop: '0.4rem', lineHeight: 1.6 }}>
-        {value === 'sell'
-          ? 'Cuts loss immediately if price falls back after exiting buy zone'
-          : 'Waits for sell zone hit or trailing stop — ignores buy-zone pullbacks'}
-      </div>
-    </div>
-  )
-}
-
 function ConfigPanel({ config, setConfig, disabled }) {
   const fields = [
     { key: 'paperBalance', label: 'Starting Balance ($)', min: 1, max: 1000, step: 1, format: v => `$${v}`, display: v => v, parse: v => v },
@@ -422,15 +358,6 @@ function ConfigPanel({ config, setConfig, disabled }) {
           </div>
         )
       })}
-
-      {/* Divider */}
-      <div style={{ borderTop: '1px solid rgba(240,240,248,0.07)', paddingTop: '0.75rem' }}>
-        <ExitStrategyToggle
-          value={config.exitStrategy}
-          onChange={val => setConfig(c => ({ ...c, exitStrategy: val }))}
-          disabled={disabled}
-        />
-      </div>
     </div>
   )
 }
@@ -440,7 +367,6 @@ function OutcomeCard({ assetId, outcomeName, ask, bid, mid, prevAsk, position, c
   const inBuyZone = ask >= buyZoneLow && ask <= buyZoneHigh
   const inSellZone = ask >= sellZoneLow && ask <= sellZoneHigh
   const uPnL = position ? (ask - position.buyAsk) * position.shares : 0
-  const exitedUp = position?.exitedBuyZone || false
   return (
     <div className="card-dark outcome-card" style={{ flex: 1 }}>
       <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: '2px', background: color }} />
@@ -449,18 +375,11 @@ function OutcomeCard({ assetId, outcomeName, ask, bid, mid, prevAsk, position, c
           <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.6rem', color: '#2a2a3a', letterSpacing: '0.1em', marginBottom: '0.3rem' }}>{assetId.slice(0, 12)}…</div>
           <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: '1.1rem', letterSpacing: '2px', color: '#f0f0f8' }}>{outcomeName}</div>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', alignItems: 'flex-end' }}>
-          {position && (
-            <div style={{ background: 'rgba(232,255,71,0.08)', border: '1px solid rgba(232,255,71,0.2)', padding: '0.2rem 0.6rem' }}>
-              <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.55rem', color: '#e8ff47', letterSpacing: '0.1em' }}>HOLDING</span>
-            </div>
-          )}
-          {position && exitedUp && (
-            <div style={{ background: 'rgba(167,139,250,0.1)', border: '1px solid rgba(167,139,250,0.25)', padding: '0.2rem 0.6rem' }}>
-              <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.5rem', color: '#a78bfa', letterSpacing: '0.08em' }}>EXITED BUY ZONE ↑</span>
-            </div>
-          )}
-        </div>
+        {position && (
+          <div style={{ background: 'rgba(232,255,71,0.08)', border: '1px solid rgba(232,255,71,0.2)', padding: '0.2rem 0.6rem' }}>
+            <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.55rem', color: '#e8ff47', letterSpacing: '0.1em' }}>HOLDING</span>
+          </div>
+        )}
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.5rem', marginBottom: '1rem' }}>
         {[
@@ -501,7 +420,6 @@ function OutcomeCard({ assetId, outcomeName, ask, bid, mid, prevAsk, position, c
             { label: 'Peak Ask', value: `${(position.peakAsk * 100).toFixed(1)}¢`, color: '#a78bfa' },
             { label: 'Shares', value: position.shares, color: '#f0f0f8' },
             { label: 'Unrealized P&L', value: `${uPnL >= 0 ? '+' : ''}$${uPnL.toFixed(2)}`, color: uPnL >= 0 ? '#47d4ff' : '#ff4766' },
-            { label: 'Zone status', value: exitedUp ? 'Watching for sell zone' : 'In / near buy zone', color: exitedUp ? '#a78bfa' : '#47d4ff' },
           ].map(r => (
             <div key={r.label} style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.3rem' }}>
               <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.58rem', color: '#6b6b8a' }}>{r.label}</span>
@@ -579,7 +497,6 @@ export default function Page() {
     sellZoneHigh: 0.69,
     peakDropCents: 0.01,
     buyCooldownMs: 0,
-    exitStrategy: 'sell', // 'sell' | 'hold'
   })
 
   const [balance, setBalance] = useState(10)
@@ -667,6 +584,7 @@ export default function Page() {
   const outcomes = marketInfo?.outcomes || []
 
   const activeSource = Object.values(wsSources)[0] || '—'
+  const tickCount = Object.keys(ticks).length
 
   return (
     <>
@@ -764,7 +682,6 @@ export default function Page() {
                       { label: 'Elapsed', value: formatTime(elapsedSeconds), color: '#f0f0f8' },
                       { label: 'Feed', value: botRunning ? activeSource : '—', color: activeSource === 'WS' ? '#e8ff47' : '#47d4ff' },
                       { label: 'Open', value: openCount, color: openCount > 0 ? '#a78bfa' : '#6b6b8a' },
-                      { label: 'Exit Mode', value: config.exitStrategy === 'sell' ? 'SELL' : 'HOLD', color: config.exitStrategy === 'sell' ? '#ff4766' : '#a78bfa' },
                     ].map(m => (
                       <div key={m.label} style={{ textAlign: 'right' }}>
                         <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.5rem', color: '#2a2a3a', letterSpacing: '0.1em', textTransform: 'uppercase' }}>{m.label}</div>
@@ -907,9 +824,8 @@ export default function Page() {
                   {[
                     { icon: '🟢', label: 'BUY Zone', value: `${Math.round(config.buyZoneLow*100)}–${Math.round(config.buyZoneHigh*100)}¢ ask`, color: '#47d4ff' },
                     { icon: '✅', label: 'SELL Target', value: `${Math.round(config.sellZoneLow*100)}–${Math.round(config.sellZoneHigh*100)}¢ ask`, color: '#e8ff47' },
-                    { icon: '🔴', label: 'Stop-Loss', value: config.exitStrategy === 'sell' ? 'Sell on any drop' : 'Hold — wait for zone', color: '#ff4766' },
+                    { icon: '🔴', label: 'Stop-Loss', value: 'Below buy price', color: '#ff4766' },
                     { icon: '📉', label: 'Trailing Stop', value: `${Math.round(config.peakDropCents*100)}¢ drop from peak`, color: '#a78bfa' },
-                    { icon: config.exitStrategy === 'sell' ? '✂️' : '⏳', label: 'Exit Mode', value: config.exitStrategy === 'sell' ? 'Sell on drop' : 'Hold for zone', color: config.exitStrategy === 'sell' ? '#ff4766' : '#a78bfa' },
                     { icon: '💰', label: 'Starting Balance', value: `$${config.paperBalance}`, color: '#f0f0f8' },
                   ].map(s => (
                     <div key={s.label} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
@@ -949,7 +865,7 @@ export default function Page() {
                   'Connects to wss://ws-subscriptions-clob.polymarket.com',
                   'Polls clob.polymarket.com/price every 5s as backup',
                   'Executes paper trades on real ask/bid prices',
-                  'Choose: sell immediately or hold on buy-zone drop',
+                  'Tracks P&L and unrealized gains live',
                 ].map(item => (
                   <div key={item} style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', fontFamily: "'Space Mono', monospace", fontSize: '0.65rem', color: '#6b6b8a', letterSpacing: '0.05em' }}>
                     <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#e8ff47" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
