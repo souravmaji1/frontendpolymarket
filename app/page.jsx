@@ -78,7 +78,7 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
   let tokenToOutcome = {}
   let clobTokenIds = []
 
-  function tryBuy(assetId, outcomeName, ask) {
+  function tryBu(assetId, outcomeName, ask) {
     if (positions[assetId]) return
     if (!ask || ask <= 0) return
     const cooldown = config.buyCooldownMs - (Date.now() - (lastSellTime[assetId] || 0))
@@ -95,6 +95,24 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
       onLog(`BUY ${outcomeName} | Ask@${(ask*100).toFixed(1)}¢ | ${shares}sh | $${cost.toFixed(2)}`, 'buy')
     }
   }
+
+  function tryBuy(assetId, outcomeName, ask) {
+  if (positions[assetId]) return
+  if (!ask || ask <= 0) return
+  const cooldown = config.buyCooldownMs - (Date.now() - (lastSellTime[assetId] || 0))
+  if (cooldown > 0) return
+  if (ask >= config.buyZoneLow && ask <= config.buyZoneHigh) {
+    const shares = 1 / ask
+    const cost = 1
+    if (paperBalance < cost) return
+    paperBalance -= cost
+    positions[assetId] = { shares, buyAsk: ask, outcomeName, peakAsk: ask }
+    const entry = { type: 'BUY', outcome: outcomeName, shares: shares.toFixed(4), askPrice: (ask * 100).toFixed(1), cost: cost.toFixed(2), balanceAfter: paperBalance.toFixed(2), time: new Date().toLocaleTimeString(), assetId }
+    tradeLog.push(entry)
+    onTrade(entry, paperBalance, positions)
+    onLog(`BUY ${outcomeName} | Ask@${(ask*100).toFixed(1)}¢ | ${shares.toFixed(4)}sh | $${cost.toFixed(2)}`, 'buy')
+  }
+}
 
   function trySell(assetId, ask) {
     const pos = positions[assetId]
@@ -865,3 +883,7 @@ export default function Page() {
     </>
   )
 }
+
+
+
+
