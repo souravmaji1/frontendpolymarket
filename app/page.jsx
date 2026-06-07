@@ -1,3 +1,5 @@
+
+
 'use client'
 
 import { useState, useEffect, useRef, useCallback } from 'react'
@@ -38,9 +40,17 @@ function InjectStyles() {
       .danger-btn:hover { background: rgba(255,71,102,0.08); transform: translateY(-2px); }
       .ghost-btn { background: transparent; border: 1px solid rgba(240,240,248,0.15); color: #6b6b8a; padding: 0.85rem 2rem; font-family: 'Space Mono', monospace; font-size: 0.72rem; letter-spacing: 0.2em; text-transform: uppercase; cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; gap: 0.5rem; }
       .ghost-btn:hover { border-color: #f0f0f8; color: #f0f0f8; }
+      .mini-btn { background: transparent; border: 1px solid rgba(240,240,248,0.12); color: #6b6b8a; padding: 0.3rem 0.7rem; font-family: 'Space Mono', monospace; font-size: 0.58rem; letter-spacing: 0.1em; text-transform: uppercase; cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; gap: 0.3rem; }
+      .mini-btn:hover:not(:disabled) { border-color: #e8ff47; color: #e8ff47; }
+      .mini-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+      .mini-btn-danger { border-color: rgba(255,71,102,0.3); color: #ff4766; }
+      .mini-btn-danger:hover:not(:disabled) { border-color: #ff4766; background: rgba(255,71,102,0.06); color: #ff4766; }
       .slug-input { background: #111118; border: 1px solid rgba(240,240,248,0.12); color: #f0f0f8; padding: 0.9rem 1.2rem; font-family: 'Space Mono', monospace; font-size: 0.82rem; letter-spacing: 0.05em; width: 100%; outline: none; transition: all 0.2s; }
       .slug-input:focus { border-color: #e8ff47; box-shadow: 0 0 0 1px rgba(232,255,71,0.15); }
       .slug-input::placeholder { color: #2a2a3a; }
+      .zone-input { background: #0a0a0f; border: 1px solid rgba(240,240,248,0.1); color: #f0f0f8; padding: 0.45rem 0.6rem; font-family: 'Space Mono', monospace; font-size: 0.7rem; width: 60px; outline: none; transition: all 0.2s; text-align: center; }
+      .zone-input:focus { border-color: #e8ff47; }
+      .zone-input::placeholder { color: #2a2a3a; }
       .card-dark { background: #111118; border: 1px solid rgba(240,240,248,0.07); }
       .stat-num { font-family: 'Bebas Neue', sans-serif; font-size: 2.2rem; line-height: 1; letter-spacing: 2px; }
       .section-label { font-family: 'Space Mono', monospace; font-size: 0.62rem; letter-spacing: 0.3em; text-transform: uppercase; color: #e8ff47; display: flex; align-items: center; gap: 0.8rem; }
@@ -54,6 +64,8 @@ function InjectStyles() {
       .status-stopped { background: #ff4766; }
       .status-idle { background: #2a2a3a; }
       .outcome-card { padding: 1.5rem; transition: all 0.3s; position: relative; overflow: hidden; }
+      .zone-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 0.75rem; background: #0a0a0f; border: 1px solid rgba(240,240,248,0.06); margin-bottom: 4px; }
+      .zone-row:last-child { margin-bottom: 0; }
       @media (max-width: 768px) { .dashboard-grid { grid-template-columns: 1fr !important; } .stats-row { grid-template-columns: 1fr 1fr !important; } .outcomes-row { grid-template-columns: 1fr !important; } .hero-pad { padding: 0 1.5rem !important; } }
     `
     const style = document.createElement('style')
@@ -78,41 +90,43 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
   let tokenToOutcome = {}
   let clobTokenIds = []
 
-  function tryBu(assetId, outcomeName, ask) {
+  // Returns the matching buy zone for this ask price, or null
+  function matchBuyZone(ask) {
+    for (const zone of config.buyZones) {
+      const lo = zone.low / 100
+      const hi = zone.high / 100
+      if (ask >= lo && ask <= hi) return zone
+    }
+    return null
+  }
+
+  // Returns the matching sell zone for this ask price, or null
+  function matchSellZone(ask) {
+    for (const zone of config.sellZones) {
+      const lo = zone.low / 100
+      const hi = zone.high / 100
+      if (ask >= lo && ask <= hi) return zone
+    }
+    return null
+  }
+
+  function tryBuy(assetId, outcomeName, ask) {
     if (positions[assetId]) return
     if (!ask || ask <= 0) return
     const cooldown = config.buyCooldownMs - (Date.now() - (lastSellTime[assetId] || 0))
     if (cooldown > 0) return
-    if (ask >= config.buyZoneLow && ask <= config.buyZoneHigh) {
-      const shares = Math.floor(1 / ask)
-      if (shares <= 0 || paperBalance < shares * ask) return
-      const cost = shares * ask
-      paperBalance -= cost
-      positions[assetId] = { shares, buyAsk: ask, outcomeName, peakAsk: ask }
-      const entry = { type: 'BUY', outcome: outcomeName, shares, askPrice: (ask * 100).toFixed(1), cost: cost.toFixed(2), balanceAfter: paperBalance.toFixed(2), time: new Date().toLocaleTimeString(), assetId }
-      tradeLog.push(entry)
-      onTrade(entry, paperBalance, positions)
-      onLog(`BUY ${outcomeName} | Ask@${(ask*100).toFixed(1)}¢ | ${shares}sh | $${cost.toFixed(2)}`, 'buy')
-    }
-  }
-
-  function tryBuy(assetId, outcomeName, ask) {
-  if (positions[assetId]) return
-  if (!ask || ask <= 0) return
-  const cooldown = config.buyCooldownMs - (Date.now() - (lastSellTime[assetId] || 0))
-  if (cooldown > 0) return
-  if (ask >= config.buyZoneLow && ask <= config.buyZoneHigh) {
-    const shares = 1 / ask
+    const zone = matchBuyZone(ask)
+    if (!zone) return
     const cost = 1
     if (paperBalance < cost) return
+    const shares = 1 / ask
     paperBalance -= cost
-    positions[assetId] = { shares, buyAsk: ask, outcomeName, peakAsk: ask }
+    positions[assetId] = { shares, buyAsk: ask, outcomeName, peakAsk: ask, buyZone: zone }
     const entry = { type: 'BUY', outcome: outcomeName, shares: shares.toFixed(4), askPrice: (ask * 100).toFixed(1), cost: cost.toFixed(2), balanceAfter: paperBalance.toFixed(2), time: new Date().toLocaleTimeString(), assetId }
     tradeLog.push(entry)
     onTrade(entry, paperBalance, positions)
-    onLog(`BUY ${outcomeName} | Ask@${(ask*100).toFixed(1)}¢ | ${shares.toFixed(4)}sh | $${cost.toFixed(2)}`, 'buy')
+    onLog(`BUY ${outcomeName} | Ask@${(ask*100).toFixed(1)}¢ [zone ${(zone.low)}–${(zone.high)}¢] | ${shares.toFixed(4)}sh | $${cost.toFixed(2)}`, 'buy')
   }
-}
 
   function trySell(assetId, ask) {
     const pos = positions[assetId]
@@ -121,16 +135,19 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
 
     let shouldSell = false, sellReason = ''
 
-    // Stop-loss: price has fallen below what we paid
+    // Stop-loss: price fell below buy price
     if (ask < pos.buyAsk) {
       shouldSell = true
       sellReason = `Stop-loss: bought@${(pos.buyAsk*100).toFixed(1)}¢ now@${(ask*100).toFixed(1)}¢`
     }
 
-    // Take-profit: price has reached the configured sell target zone
-    if (!shouldSell && ask >= config.sellZoneLow && ask <= config.sellZoneHigh) {
-      shouldSell = true
-      sellReason = `Target zone: ask@${(ask*100).toFixed(1)}¢`
+    // Take-profit: price entered any sell zone
+    if (!shouldSell) {
+      const zone = matchSellZone(ask)
+      if (zone) {
+        shouldSell = true
+        sellReason = `Target zone ${zone.low}–${zone.high}¢: ask@${(ask*100).toFixed(1)}¢`
+      }
     }
 
     if (!shouldSell) return
@@ -156,15 +173,11 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
     if (bid > 0) lastBid[assetId] = bid
     if (ask > 0) lastAsk[assetId] = ask
 
-    // Snapshot whether we had a position BEFORE this tick
     const hadPositionBefore = !!positions[assetId]
 
     onTick({ assetId, outcomeName, ask, bid, mid, prevAsk, source, positions: { ...positions }, balance: paperBalance })
     tryBuy(assetId, outcomeName, ask)
 
-    // Only try to sell if we already held a position before this tick arrived.
-    // This prevents an immediate stop-loss firing on the same tick we just bought,
-    // which happened when WS sent best_ask=0 causing a stale price fallback.
     if (hadPositionBefore) {
       trySell(assetId, ask)
     }
@@ -178,11 +191,7 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
 
     ws.onopen = () => {
       onLog(`WebSocket connected — subscribing to ${clobTokenIds.length} assets`, 'info')
-      ws.send(JSON.stringify({
-        assets_ids: clobTokenIds,
-        type: 'market',
-        custom_feature_enabled: true
-      }))
+      ws.send(JSON.stringify({ assets_ids: clobTokenIds, type: 'market', custom_feature_enabled: true }))
     }
 
     ws.onmessage = (event) => {
@@ -207,9 +216,7 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
       setTimeout(connectWebSocket, 4000)
     }
 
-    ws.onerror = () => {
-      onLog(`WebSocket error — falling back to polling`, 'info')
-    }
+    ws.onerror = () => { onLog(`WebSocket error — falling back to polling`, 'info') }
   }
 
   async function pollPrice(tokenId, outcomeName) {
@@ -244,9 +251,7 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
 
       const safeParse = (val) => {
         if (Array.isArray(val)) return val
-        if (typeof val === 'string') {
-          try { return JSON.parse(val) } catch { return [] }
-        }
+        if (typeof val === 'string') { try { return JSON.parse(val) } catch { return [] } }
         return []
       }
 
@@ -264,12 +269,12 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
       })
 
       onMarketLoaded({ question: market.question, outcomes, slug, clobTokenIds })
-
       onLog(`Market: ${market.question}`, 'info')
       onLog(`Outcomes: ${outcomes.join(' vs ')}`, 'info')
       onLog(`Assets: ${clobTokenIds.length} token(s) found`, 'info')
       onLog(`Initial prices: ${prices.map((p, i) => `${outcomes[i] || i}: ${(parseFloat(p)*100).toFixed(1)}¢`).join(' | ')}`, 'info')
-      onLog(`Strategy: BUY ${(config.buyZoneLow*100)}–${(config.buyZoneHigh*100)}¢ | SELL ${(config.sellZoneLow*100)}–${(config.sellZoneHigh*100)}¢`, 'info')
+      onLog(`Buy zones: ${config.buyZones.map(z => `${z.low}–${z.high}¢`).join(', ')}`, 'info')
+      onLog(`Sell zones: ${config.sellZones.map(z => `${z.low}–${z.high}¢`).join(', ')}`, 'info')
       onLog(`Starting balance: $${config.paperBalance}`, 'info')
 
       connectWebSocket()
@@ -292,84 +297,131 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
   }
 }
 
-// ==================== NAVBAR ====================
-function Navbar({ botRunning }) {
-  const [scrolled, setScrolled] = useState(false)
-  useEffect(() => {
-    const fn = () => setScrolled(window.scrollY > 40)
-    window.addEventListener('scroll', fn)
-    return () => window.removeEventListener('scroll', fn)
-  }, [])
-  return (
-    <nav style={{ position: 'fixed', top: 0, left: 0, right: 0, zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '1rem 4rem', background: scrolled ? 'rgba(10,10,15,0.95)' : 'rgba(10,10,15,0.7)', backdropFilter: 'blur(20px)', borderBottom: '1px solid rgba(240,240,248,0.07)', transition: 'all 0.4s' }}>
-      <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: '1.5rem', letterSpacing: '4px', color: '#e8ff47' }}>POLY<span style={{ color: '#ff4766' }}>BOT</span></div>
-      <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.6rem', letterSpacing: '0.2em', color: '#2a2a3a', textTransform: 'uppercase' }}>Live Trading Monitor · Real CLOB Data</div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-        <div className={`status-dot ${botRunning ? 'status-live' : 'status-idle'}`} />
-        <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.6rem', color: '#6b6b8a', letterSpacing: '0.15em', textTransform: 'uppercase' }}>{botRunning ? 'Live' : 'Idle'}</span>
-      </div>
-    </nav>
-  )
-}
+// ==================== ZONE MANAGER ====================
+function ZoneManager({ zones, setZones, disabled, accentColor, label, placeholder }) {
+  const addZone = () => {
+    setZones(prev => [...prev, { id: Date.now(), low: placeholder.low, high: placeholder.high }])
+  }
+  const removeZone = (id) => {
+    setZones(prev => prev.filter(z => z.id !== id))
+  }
+  const updateZone = (id, field, val) => {
+    const n = parseInt(val, 10)
+    if (isNaN(n)) return
+    setZones(prev => prev.map(z => z.id === id ? { ...z, [field]: Math.min(99, Math.max(1, n)) } : z))
+  }
 
-function Ticker() {
-  const items = ['Live CLOB WebSocket', 'Real Ask Prices', 'Polymarket Feed', 'Stop Loss Only', 'Take Profit Zone', 'Hold Through Dips', 'Paper Trading', 'Gamma API', 'Real-time Monitor']
   return (
-    <div className="ticker-wrap">
-      <div className="ticker-inner">
-        {[...items, ...items].map((it, i) => <div className="ticker-item" key={i}><span>◆</span>{it}</div>)}
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+        <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.6rem', color: accentColor, letterSpacing: '0.12em', textTransform: 'uppercase' }}>{label}</span>
+        <button className="mini-btn" onClick={addZone} disabled={disabled} style={{ borderColor: `${accentColor}55`, color: accentColor }}>
+          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Add Zone
+        </button>
       </div>
+      {zones.length === 0 && (
+        <div style={{ padding: '0.6rem', background: '#0a0a0f', border: '1px dashed rgba(240,240,248,0.08)', fontFamily: "'Space Mono', monospace", fontSize: '0.58rem', color: '#2a2a3a', textAlign: 'center', letterSpacing: '0.08em' }}>
+          No zones — add one
+        </div>
+      )}
+      {zones.map((zone, idx) => (
+        <div className="zone-row" key={zone.id}>
+          <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.52rem', color: '#2a2a3a', letterSpacing: '0.08em', minWidth: '16px' }}>#{idx + 1}</span>
+          <input
+            className="zone-input"
+            type="number"
+            min={1} max={99}
+            value={zone.low}
+            disabled={disabled}
+            onChange={e => updateZone(zone.id, 'low', e.target.value)}
+            style={{ borderColor: disabled ? 'rgba(240,240,248,0.06)' : `${accentColor}33` }}
+          />
+          <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.55rem', color: '#2a2a3a' }}>–</span>
+          <input
+            className="zone-input"
+            type="number"
+            min={1} max={99}
+            value={zone.high}
+            disabled={disabled}
+            onChange={e => updateZone(zone.id, 'high', e.target.value)}
+            style={{ borderColor: disabled ? 'rgba(240,240,248,0.06)' : `${accentColor}33` }}
+          />
+          <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.55rem', color: '#2a2a3a', flex: 1 }}>¢</span>
+          <button
+            className="mini-btn mini-btn-danger"
+            onClick={() => removeZone(zone.id)}
+            disabled={disabled || zones.length <= 1}
+            title="Remove zone"
+          >
+            <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          </button>
+        </div>
+      ))}
     </div>
   )
 }
 
+// ==================== CONFIG PANEL ====================
 function ConfigPanel({ config, setConfig, disabled }) {
-  const fields = [
-    { key: 'paperBalance', label: 'Starting Balance ($)', min: 1, max: 1000, step: 1, format: v => `$${v}`, display: v => v, parse: v => v },
-    { key: 'buyZoneLow', label: 'Buy Zone Low (¢)', min: 1, max: 99, step: 1, display: v => Math.round(v * 100), parse: v => v / 100, format: v => `${Math.round(v*100)}¢` },
-    { key: 'buyZoneHigh', label: 'Buy Zone High (¢)', min: 1, max: 99, step: 1, display: v => Math.round(v * 100), parse: v => v / 100, format: v => `${Math.round(v*100)}¢` },
-    { key: 'sellZoneLow', label: 'Sell Zone Low (¢)', min: 1, max: 99, step: 1, display: v => Math.round(v * 100), parse: v => v / 100, format: v => `${Math.round(v*100)}¢` },
-    { key: 'sellZoneHigh', label: 'Sell Zone High (¢)', min: 1, max: 99, step: 1, display: v => Math.round(v * 100), parse: v => v / 100, format: v => `${Math.round(v*100)}¢` },
-  ]
+  const balanceMin = 1, balanceMax = 1000
+  const balancePct = ((config.paperBalance - balanceMin) / (balanceMax - balanceMin)) * 100
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.2rem' }}>
-      {fields.map(f => {
-        const displayVal = f.display(config[f.key])
-        const minD = f.key === 'paperBalance' ? f.min : 1
-        const maxD = f.key === 'paperBalance' ? f.max : 99
-        const pct = ((displayVal - minD) / (maxD - minD)) * 100
-        return (
-          <div key={f.key}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
-              <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.65rem', color: '#6b6b8a', letterSpacing: '0.05em' }}>{f.label}</span>
-              <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.65rem', color: '#e8ff47', fontWeight: 700 }}>{f.format(config[f.key])}</span>
-            </div>
-            <div style={{ position: 'relative', height: '3px', background: 'rgba(240,240,248,0.07)' }}>
-              <div style={{ position: 'absolute', left: 0, top: 0, height: '100%', width: `${pct}%`, background: disabled ? '#2a2a3a' : '#e8ff47', transition: 'width 0.15s' }} />
-              <input type="range" min={minD} max={maxD} step={f.step} value={displayVal} disabled={disabled}
-                onChange={e => setConfig(c => ({ ...c, [f.key]: f.parse(Number(e.target.value)) }))}
-                style={{ position: 'absolute', top: '50%', left: 0, transform: 'translateY(-50%)', width: '100%', height: '20px', opacity: 0, cursor: disabled ? 'not-allowed' : 'pointer', margin: 0 }}
-              />
-              <div style={{ position: 'absolute', top: '50%', left: `${pct}%`, transform: 'translate(-50%, -50%)', width: '12px', height: '12px', borderRadius: '50%', background: disabled ? '#2a2a3a' : '#e8ff47', border: '2px solid #0a0a0f', pointerEvents: 'none', transition: 'left 0.15s' }} />
-            </div>
-          </div>
-        )
-      })}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.4rem' }}>
+      {/* Balance slider */}
+      <div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+          <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.65rem', color: '#6b6b8a', letterSpacing: '0.05em' }}>Starting Balance ($)</span>
+          <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.65rem', color: '#e8ff47', fontWeight: 700 }}>${config.paperBalance}</span>
+        </div>
+        <div style={{ position: 'relative', height: '3px', background: 'rgba(240,240,248,0.07)' }}>
+          <div style={{ position: 'absolute', left: 0, top: 0, height: '100%', width: `${balancePct}%`, background: disabled ? '#2a2a3a' : '#e8ff47', transition: 'width 0.15s' }} />
+          <input type="range" min={balanceMin} max={balanceMax} step={1} value={config.paperBalance} disabled={disabled}
+            onChange={e => setConfig(c => ({ ...c, paperBalance: Number(e.target.value) }))}
+            style={{ position: 'absolute', top: '50%', left: 0, transform: 'translateY(-50%)', width: '100%', height: '20px', opacity: 0, cursor: disabled ? 'not-allowed' : 'pointer', margin: 0 }}
+          />
+          <div style={{ position: 'absolute', top: '50%', left: `${balancePct}%`, transform: 'translate(-50%, -50%)', width: '12px', height: '12px', borderRadius: '50%', background: disabled ? '#2a2a3a' : '#e8ff47', border: '2px solid #0a0a0f', pointerEvents: 'none', transition: 'left 0.15s' }} />
+        </div>
+      </div>
+
+      {/* Buy Zones */}
+      <ZoneManager
+        zones={config.buyZones}
+        setZones={zones => setConfig(c => ({ ...c, buyZones: typeof zones === 'function' ? zones(c.buyZones) : zones }))}
+        disabled={disabled}
+        accentColor="#47d4ff"
+        label="Buy Zones (¢)"
+        placeholder={{ low: 40, high: 50 }}
+      />
+
+      {/* Sell Zones */}
+      <ZoneManager
+        zones={config.sellZones}
+        setZones={zones => setConfig(c => ({ ...c, sellZones: typeof zones === 'function' ? zones(c.sellZones) : zones }))}
+        disabled={disabled}
+        accentColor="#e8ff47"
+        label="Sell Zones (¢)"
+        placeholder={{ low: 60, high: 70 }}
+      />
+
       <div style={{ padding: '0.75rem', background: 'rgba(232,255,71,0.04)', border: '1px solid rgba(232,255,71,0.1)' }}>
         <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.55rem', color: '#e8ff47', letterSpacing: '0.1em', marginBottom: '0.3rem' }}>HOLD LOGIC</div>
         <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.58rem', color: '#6b6b8a', lineHeight: 1.6 }}>
-          Holds through all dips above buy price. Sell only triggers at target zone or if price falls below buy price.
+          Holds through all dips above buy price. Sell triggers at any sell zone or if price falls below buy price (stop-loss).
         </div>
       </div>
     </div>
   )
 }
 
-function OutcomeCard({ assetId, outcomeName, ask, bid, mid, prevAsk, position, color, buyZoneLow, buyZoneHigh, sellZoneLow, sellZoneHigh }) {
+// ==================== OUTCOME CARD ====================
+function OutcomeCard({ assetId, outcomeName, ask, bid, mid, prevAsk, position, color, buyZones, sellZones }) {
   const askDelta = ask - prevAsk
-  const inBuyZone = ask >= buyZoneLow && ask <= buyZoneHigh
-  const inSellZone = ask >= sellZoneLow && ask <= sellZoneHigh
+  const inBuyZone = buyZones.some(z => ask >= z.low / 100 && ask <= z.high / 100)
+  const inSellZone = sellZones.some(z => ask >= z.low / 100 && ask <= z.high / 100)
   const uPnL = position ? (ask - position.buyAsk) * position.shares : 0
+
   return (
     <div className="card-dark outcome-card" style={{ flex: 1 }}>
       <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: '2px', background: color }} />
@@ -400,28 +452,35 @@ function OutcomeCard({ assetId, outcomeName, ask, bid, mid, prevAsk, position, c
         <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.6rem', color: askDelta >= 0 ? '#47d4ff' : '#ff4766', letterSpacing: '0.08em' }}>
           Ask Δ {askDelta >= 0 ? '+' : ''}{(askDelta * 100).toFixed(2)}¢
         </span>
-        <div style={{ display: 'flex', gap: '0.3rem' }}>
+        <div style={{ display: 'flex', gap: '0.3rem', flexWrap: 'wrap' }}>
           {inBuyZone && <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.5rem', background: 'rgba(71,212,255,0.12)', color: '#47d4ff', padding: '0.15rem 0.4rem', border: '1px solid rgba(71,212,255,0.2)' }}>BUY ZONE</span>}
           {inSellZone && <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.5rem', background: 'rgba(232,255,71,0.12)', color: '#e8ff47', padding: '0.15rem 0.4rem', border: '1px solid rgba(232,255,71,0.2)' }}>SELL ZONE</span>}
         </div>
       </div>
-      <div style={{ position: 'relative', height: '3px', background: 'rgba(240,240,248,0.07)', marginBottom: '0.4rem' }}>
-        <div style={{ position: 'absolute', left: `${buyZoneLow*100}%`, width: `${(buyZoneHigh-buyZoneLow)*100}%`, height: '100%', background: 'rgba(71,212,255,0.3)' }} />
-        <div style={{ position: 'absolute', left: `${sellZoneLow*100}%`, width: `${(sellZoneHigh-sellZoneLow)*100}%`, height: '100%', background: 'rgba(232,255,71,0.3)' }} />
-        {ask > 0 && <div style={{ position: 'absolute', top: '-3px', left: `${Math.min(95, Math.max(5, ask * 100))}%`, width: '2px', height: '9px', background: color, transition: 'left 0.5s ease' }} />}
+
+      {/* Price bar with all zones */}
+      <div style={{ position: 'relative', height: '6px', background: 'rgba(240,240,248,0.07)', marginBottom: '0.4rem', borderRadius: '2px' }}>
+        {buyZones.map((z, i) => (
+          <div key={`b${i}`} style={{ position: 'absolute', left: `${z.low}%`, width: `${z.high - z.low}%`, height: '100%', background: 'rgba(71,212,255,0.35)', borderRadius: '1px' }} />
+        ))}
+        {sellZones.map((z, i) => (
+          <div key={`s${i}`} style={{ position: 'absolute', left: `${z.low}%`, width: `${z.high - z.low}%`, height: '100%', background: 'rgba(232,255,71,0.35)', borderRadius: '1px' }} />
+        ))}
+        {ask > 0 && <div style={{ position: 'absolute', top: '-2px', left: `${Math.min(97, Math.max(3, ask * 100))}%`, width: '2px', height: '10px', background: color, borderRadius: '1px', transition: 'left 0.5s ease' }} />}
       </div>
       <div style={{ display: 'flex', justifyContent: 'space-between' }}>
         <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.48rem', color: '#2a2a3a' }}>0¢</span>
-        <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.48rem', color: '#47d4ff' }}>{Math.round(buyZoneLow*100)}¢↑buy</span>
-        <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.48rem', color: '#e8ff47' }}>{Math.round(sellZoneLow*100)}¢↑sell</span>
+        <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.48rem', color: '#47d4ff' }}>Buy zones ↑</span>
+        <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.48rem', color: '#e8ff47' }}>Sell zones ↑</span>
         <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.48rem', color: '#2a2a3a' }}>100¢</span>
       </div>
+
       {position && (
         <div style={{ marginTop: '0.75rem', padding: '0.75rem', background: '#0a0a0f', border: '1px solid rgba(232,255,71,0.1)' }}>
           {[
             { label: 'Bought Ask', value: `${(position.buyAsk * 100).toFixed(1)}¢`, color: '#f0f0f8' },
             { label: 'Peak Ask', value: `${(position.peakAsk * 100).toFixed(1)}¢`, color: '#a78bfa' },
-            { label: 'Shares', value: position.shares, color: '#f0f0f8' },
+            { label: 'Shares', value: typeof position.shares === 'number' ? position.shares.toFixed(4) : position.shares, color: '#f0f0f8' },
             { label: 'Unrealized P&L', value: `${uPnL >= 0 ? '+' : ''}$${uPnL.toFixed(2)}`, color: uPnL >= 0 ? '#47d4ff' : '#ff4766' },
           ].map(r => (
             <div key={r.label} style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.3rem' }}>
@@ -431,6 +490,37 @@ function OutcomeCard({ assetId, outcomeName, ask, bid, mid, prevAsk, position, c
           ))}
         </div>
       )}
+    </div>
+  )
+}
+
+// ==================== NAVBAR ====================
+function Navbar({ botRunning }) {
+  const [scrolled, setScrolled] = useState(false)
+  useEffect(() => {
+    const fn = () => setScrolled(window.scrollY > 40)
+    window.addEventListener('scroll', fn)
+    return () => window.removeEventListener('scroll', fn)
+  }, [])
+  return (
+    <nav style={{ position: 'fixed', top: 0, left: 0, right: 0, zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '1rem 4rem', background: scrolled ? 'rgba(10,10,15,0.95)' : 'rgba(10,10,15,0.7)', backdropFilter: 'blur(20px)', borderBottom: '1px solid rgba(240,240,248,0.07)', transition: 'all 0.4s' }}>
+      <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: '1.5rem', letterSpacing: '4px', color: '#e8ff47' }}>POLY<span style={{ color: '#ff4766' }}>BOT</span></div>
+      <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.6rem', letterSpacing: '0.2em', color: '#2a2a3a', textTransform: 'uppercase' }}>Live Trading Monitor · Real CLOB Data</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+        <div className={`status-dot ${botRunning ? 'status-live' : 'status-idle'}`} />
+        <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.6rem', color: '#6b6b8a', letterSpacing: '0.15em', textTransform: 'uppercase' }}>{botRunning ? 'Live' : 'Idle'}</span>
+      </div>
+    </nav>
+  )
+}
+
+function Ticker() {
+  const items = ['Live CLOB WebSocket', 'Real Ask Prices', 'Polymarket Feed', 'Multi-Zone Strategy', 'Take Profit Zones', 'Hold Through Dips', 'Paper Trading', 'Gamma API', 'Real-time Monitor']
+  return (
+    <div className="ticker-wrap">
+      <div className="ticker-inner">
+        {[...items, ...items].map((it, i) => <div className="ticker-item" key={i}><span>◆</span>{it}</div>)}
+      </div>
     </div>
   )
 }
@@ -494,11 +584,12 @@ export default function Page() {
   const [botInstance, setBotInstance] = useState(null)
   const [config, setConfig] = useState({
     paperBalance: 10,
-    buyZoneLow: 0.62,
-    buyZoneHigh: 0.64,
-    sellZoneLow: 0.68,
-    sellZoneHigh: 0.69,
-    peakDropCents: 0.01,
+    buyZones: [
+      { id: 1, low: 62, high: 64 },
+    ],
+    sellZones: [
+      { id: 2, low: 68, high: 69 },
+    ],
     buyCooldownMs: 0,
   })
 
@@ -724,10 +815,8 @@ export default function Page() {
                         prevAsk={tick?.prevAsk ?? 0}
                         position={positions[id] || null}
                         color={i === 0 ? '#e8ff47' : '#47d4ff'}
-                        buyZoneLow={config.buyZoneLow}
-                        buyZoneHigh={config.buyZoneHigh}
-                        sellZoneLow={config.sellZoneLow}
-                        sellZoneHigh={config.sellZoneHigh}
+                        buyZones={config.buyZones}
+                        sellZones={config.sellZones}
                       />
                     )
                   })}
@@ -812,12 +901,29 @@ export default function Page() {
                 </div>
               </div>
 
+              {/* Active Strategy summary */}
               <div style={{ marginTop: '1.5rem', padding: '1.25rem 1.5rem', background: '#111118', border: '1px solid rgba(240,240,248,0.07)' }}>
                 <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.6rem', color: '#e8ff47', letterSpacing: '0.18em', textTransform: 'uppercase', marginBottom: '0.75rem' }}>Active Strategy</div>
                 <div style={{ display: 'flex', gap: '2rem', flexWrap: 'wrap' }}>
+                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: '0.5rem' }}>
+                    <span style={{ fontSize: '0.8rem', marginTop: '2px' }}>🟢</span>
+                    <div>
+                      <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.5rem', color: '#2a2a3a', letterSpacing: '0.08em', textTransform: 'uppercase' }}>Buy Zones</div>
+                      {config.buyZones.map((z, i) => (
+                        <div key={i} style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.62rem', color: '#47d4ff', fontWeight: 700, marginTop: '0.15rem' }}>{z.low}–{z.high}¢</div>
+                      ))}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: '0.5rem' }}>
+                    <span style={{ fontSize: '0.8rem', marginTop: '2px' }}>✅</span>
+                    <div>
+                      <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.5rem', color: '#2a2a3a', letterSpacing: '0.08em', textTransform: 'uppercase' }}>Sell Zones</div>
+                      {config.sellZones.map((z, i) => (
+                        <div key={i} style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.62rem', color: '#e8ff47', fontWeight: 700, marginTop: '0.15rem' }}>{z.low}–{z.high}¢</div>
+                      ))}
+                    </div>
+                  </div>
                   {[
-                    { icon: '🟢', label: 'BUY Zone', value: `${Math.round(config.buyZoneLow*100)}–${Math.round(config.buyZoneHigh*100)}¢ ask`, color: '#47d4ff' },
-                    { icon: '✅', label: 'SELL Target', value: `${Math.round(config.sellZoneLow*100)}–${Math.round(config.sellZoneHigh*100)}¢ ask`, color: '#e8ff47' },
                     { icon: '🔴', label: 'Stop-Loss', value: 'Below buy price', color: '#ff4766' },
                     { icon: '📌', label: 'Hold Logic', value: 'Holds through all dips above buy price', color: '#a78bfa' },
                     { icon: '💰', label: 'Starting Balance', value: `$${config.paperBalance}`, color: '#f0f0f8' },
@@ -832,6 +938,7 @@ export default function Page() {
                   ))}
                 </div>
               </div>
+
             </div>
           </section>
         )}
@@ -857,9 +964,9 @@ export default function Page() {
                   'Fetches market from gamma-api.polymarket.com',
                   'Connects to wss://ws-subscriptions-clob.polymarket.com',
                   'Polls clob.polymarket.com/price every 5s as backup',
-                  'Buys when ask enters your configured buy zone',
+                  'Buys when ask enters any configured buy zone',
                   'Holds through all price swings above buy price',
-                  'Sells only at target zone or below buy price (stop-loss)',
+                  'Sells at any sell zone or below buy price (stop-loss)',
                 ].map(item => (
                   <div key={item} style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', fontFamily: "'Space Mono', monospace", fontSize: '0.65rem', color: '#6b6b8a', letterSpacing: '0.05em' }}>
                     <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#e8ff47" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
@@ -883,7 +990,3 @@ export default function Page() {
     </>
   )
 }
-
-
-
-
