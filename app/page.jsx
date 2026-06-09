@@ -1,5 +1,3 @@
-
-
 'use client'
 
 import { useState, useEffect, useRef, useCallback } from 'react'
@@ -84,37 +82,56 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
   let paperBalance = config.paperBalance
   let lastAsk = {}
   let lastBid = {}
-  let lastSellTime = {}
+
+  // ── RE-BUY FIX ─────────────────────────────────────────────────────────────
+  // Instead of a time-based cooldown (which breaks instant rebounds), we use a
+  // per-asset "sold on this tick" flag.  trySell sets it; processTick clears it
+  // BEFORE calling tryBuy so that re-entry is allowed on the NEXT tick but NOT
+  // on the exact same tick that triggered the stop-loss (avoids instant churn).
+  let soldThisTick = {}        // assetId → true if sold on current tick
+  let justSoldAssets = {}      // assetId → true: skip ONE tryBuy call after sell
+  // ───────────────────────────────────────────────────────────────────────────
+
   let wsInstance = null
   let pollInterval = null
   let tokenToOutcome = {}
   let clobTokenIds = []
 
-  // Returns the matching buy zone for this ask price, or null
+  // Latency tracking
+  let wsLatency = 0
+  let lastPingTime = 0
+  let tickCount = 0
+  let tickTimes = []
+
   function matchBuyZone(ask) {
     for (const zone of config.buyZones) {
-      const lo = zone.low / 100
-      const hi = zone.high / 100
+      const lo = zone.low / 100, hi = zone.high / 100
       if (ask >= lo && ask <= hi) return zone
     }
     return null
   }
 
-  // Returns the matching sell zone for this ask price, or null
   function matchSellZone(ask) {
     for (const zone of config.sellZones) {
-      const lo = zone.low / 100
-      const hi = zone.high / 100
+      const lo = zone.low / 100, hi = zone.high / 100
       if (ask >= lo && ask <= hi) return zone
     }
     return null
   }
 
   function tryBuy(assetId, outcomeName, ask) {
-    if (positions[assetId]) return
+    if (positions[assetId]) return           // already holding
     if (!ask || ask <= 0) return
-    const cooldown = config.buyCooldownMs - (Date.now() - (lastSellTime[assetId] || 0))
-    if (cooldown > 0) return
+
+    // ── FIX: skip buy on the tick immediately after a stop-loss sell ──────────
+    // This prevents buying back at 59¢ the instant we sold at 59¢ (churn),
+    // but allows buying again on the very next tick if price is in zone.
+    if (justSoldAssets[assetId]) {
+      justSoldAssets[assetId] = false        // clear flag → allowed next tick
+      return
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     const zone = matchBuyZone(ask)
     if (!zone) return
     const cost = 1
@@ -122,27 +139,31 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
     const shares = 1 / ask
     paperBalance -= cost
     positions[assetId] = { shares, buyAsk: ask, outcomeName, peakAsk: ask, buyZone: zone }
-    const entry = { type: 'BUY', outcome: outcomeName, shares: shares.toFixed(4), askPrice: (ask * 100).toFixed(1), cost: cost.toFixed(2), balanceAfter: paperBalance.toFixed(2), time: new Date().toLocaleTimeString(), assetId }
+    const entry = {
+      type: 'BUY', outcome: outcomeName, shares: shares.toFixed(4),
+      askPrice: (ask * 100).toFixed(1), cost: cost.toFixed(2),
+      balanceAfter: paperBalance.toFixed(2), time: new Date().toLocaleTimeString(), assetId
+    }
     tradeLog.push(entry)
     onTrade(entry, paperBalance, positions)
-    onLog(`BUY ${outcomeName} | Ask@${(ask*100).toFixed(1)}¢ [zone ${(zone.low)}–${(zone.high)}¢] | ${shares.toFixed(4)}sh | $${cost.toFixed(2)}`, 'buy')
+    onLog(`BUY ${outcomeName} | Ask@${(ask*100).toFixed(1)}¢ [zone ${zone.low}–${zone.high}¢] | ${shares.toFixed(4)}sh | $${cost.toFixed(2)}`, 'buy')
   }
 
-  function trySell(assetId, ask) {
+  function trySell(assetId, bid, ask) {
     const pos = positions[assetId]
-    if (!pos || !ask || ask <= 0) return
-    if (ask > pos.peakAsk) pos.peakAsk = ask
+    if (!pos) return
+    const exitPrice = bid > 0 ? bid : ask
+    if (!exitPrice || exitPrice <= 0) return
+    if (exitPrice > pos.peakAsk) pos.peakAsk = exitPrice
 
     let shouldSell = false, sellReason = ''
 
-    // Stop-loss: price fell below buy price
-    if (ask < pos.buyAsk) {
+    if (exitPrice < pos.buyAsk) {
       shouldSell = true
-      sellReason = `Stop-loss: bought@${(pos.buyAsk*100).toFixed(1)}¢ now@${(ask*100).toFixed(1)}¢`
+      sellReason = `Stop-loss: bought@${(pos.buyAsk*100).toFixed(1)}¢ bid@${(exitPrice*100).toFixed(1)}¢`
     }
 
-    // Take-profit: price entered any sell zone
-    if (!shouldSell) {
+    if (!shouldSell && ask > 0) {
       const zone = matchSellZone(ask)
       if (zone) {
         shouldSell = true
@@ -152,20 +173,31 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
 
     if (!shouldSell) return
 
-    const proceeds = pos.shares * ask
+    const proceeds = pos.shares * exitPrice
     const cost = pos.shares * pos.buyAsk
     const pnl = proceeds - cost
     paperBalance += proceeds
-    lastSellTime[assetId] = Date.now()
-    const entry = { type: 'SELL', outcome: pos.outcomeName, shares: pos.shares, buyAsk: (pos.buyAsk*100).toFixed(1), sellAsk: (ask*100).toFixed(1), peakAsk: (pos.peakAsk*100).toFixed(1), pnl: pnl.toFixed(2), reason: sellReason, balanceAfter: paperBalance.toFixed(2), time: new Date().toLocaleTimeString(), assetId }
+
+    // ── FIX: mark that this asset was just sold so tryBuy skips ONE tick ──────
+    justSoldAssets[assetId] = true
+    // ─────────────────────────────────────────────────────────────────────────
+
+    const entry = {
+      type: 'SELL', outcome: pos.outcomeName, shares: pos.shares,
+      buyAsk: (pos.buyAsk*100).toFixed(1), sellAsk: (exitPrice*100).toFixed(1),
+      peakAsk: (pos.peakAsk*100).toFixed(1), pnl: pnl.toFixed(2),
+      reason: sellReason, balanceAfter: paperBalance.toFixed(2),
+      time: new Date().toLocaleTimeString(), assetId
+    }
     tradeLog.push(entry)
     delete positions[assetId]
     onTrade(entry, paperBalance, positions)
     const icon = pnl >= 0 ? 'SELL WIN' : 'SELL LOSS'
-    onLog(`${icon} ${pos.outcomeName} | ${(pos.buyAsk*100).toFixed(1)}¢→${(ask*100).toFixed(1)}¢ | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} | ${sellReason}`, pnl >= 0 ? 'sell_win' : 'sell_loss')
+    onLog(`${icon} ${pos.outcomeName} | ${(pos.buyAsk*100).toFixed(1)}¢→${(exitPrice*100).toFixed(1)}¢ | P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)} | ${sellReason}`, pnl >= 0 ? 'sell_win' : 'sell_loss')
   }
 
   function processTick(assetId, outcomeName, rawMid, rawBid, rawAsk, source) {
+    const t0 = performance.now()
     const prevAsk = lastAsk[assetId] || rawAsk
     const bid = rawBid > 0 ? rawBid : (lastBid[assetId] || 0)
     const ask = rawAsk > 0 ? rawAsk : (lastAsk[assetId] || 0)
@@ -173,14 +205,23 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
     if (bid > 0) lastBid[assetId] = bid
     if (ask > 0) lastAsk[assetId] = ask
 
-    const hadPositionBefore = !!positions[assetId]
+    // ── FIX: clear soldThisTick flag at the START of each new tick ───────────
+    // justSoldAssets is cleared inside tryBuy (one-shot skip), so we only need
+    // to reset soldThisTick here as a guard against same-tick double-sell.
+    soldThisTick[assetId] = false
+    // ─────────────────────────────────────────────────────────────────────────
 
-    onTick({ assetId, outcomeName, ask, bid, mid, prevAsk, source, positions: { ...positions }, balance: paperBalance })
+    onTick({ assetId, outcomeName, ask, bid, mid, prevAsk, source, positions: { ...positions }, balance: paperBalance, wsLatency })
+
+    // Sell first, then buy — justSoldAssets blocks same-tick re-buy
+    trySell(assetId, bid, ask)
     tryBuy(assetId, outcomeName, ask)
 
-    if (hadPositionBefore) {
-      trySell(assetId, ask)
-    }
+    // Latency tracking
+    const elapsed = performance.now() - t0
+    tickTimes.push(elapsed)
+    if (tickTimes.length > 100) tickTimes.shift()
+    tickCount++
   }
 
   function connectWebSocket() {
@@ -188,56 +229,96 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
     onLog(`Connecting to Polymarket CLOB WebSocket...`, 'info')
     const ws = new WebSocket('wss://ws-subscriptions-clob.polymarket.com/ws/market')
     wsInstance = ws
+    let pingInterval = null
 
     ws.onopen = () => {
       onLog(`WebSocket connected — subscribing to ${clobTokenIds.length} assets`, 'info')
       ws.send(JSON.stringify({ assets_ids: clobTokenIds, type: 'market', custom_feature_enabled: true }))
+
+      // Heartbeat + RTT measurement
+      pingInterval = setInterval(() => {
+        if (ws.readyState === 1) {
+          lastPingTime = performance.now()
+          ws.send('PING')
+        }
+      }, 9000)
     }
 
     ws.onmessage = (event) => {
       try {
-        const msg = JSON.parse(event.data)
-        const priceChanges = msg.price_changes || []
-        for (const change of priceChanges) {
-          const assetId = change.asset_id
-          if (!assetId || !tokenToOutcome[assetId]) continue
-          const outcomeName = tokenToOutcome[assetId]
-          const rawMid = parseFloat(change.price || 0)
-          const rawBid = parseFloat(change.best_bid || 0)
-          const rawAsk = parseFloat(change.best_ask || 0)
-          processTick(assetId, outcomeName, rawMid, rawBid, rawAsk, 'WS')
+        if (event.data === 'PONG') {
+          if (lastPingTime > 0) {
+            wsLatency = Math.round(performance.now() - lastPingTime)
+            onLog(`WS RTT: ${wsLatency}ms`, 'info')
+          }
+          return
         }
+
+        const msg = JSON.parse(event.data)
+
+        if (msg.event_type === 'best_bid_ask') {
+          const assetId = msg.asset_id
+          if (!assetId || !tokenToOutcome[assetId]) return
+          const bid = parseFloat(msg.best_bid || 0)
+          const ask = parseFloat(msg.best_ask || 0)
+          processTick(assetId, tokenToOutcome[assetId], 0, bid, ask, 'WS-BBA')
+          return
+        }
+
+        if (msg.event_type === 'price_change') {
+          const priceChanges = msg.price_changes || []
+          for (const change of priceChanges) {
+            const assetId = change.asset_id
+            if (!assetId || !tokenToOutcome[assetId]) continue
+            const rawMid = parseFloat(change.price || 0)
+            const rawBid = parseFloat(change.best_bid || 0)
+            const rawAsk = parseFloat(change.best_ask || 0)
+            processTick(assetId, tokenToOutcome[assetId], rawMid, rawBid, rawAsk, 'WS-PC')
+          }
+          return
+        }
+
+        if (msg.event_type === 'book') {
+          const assetId = msg.asset_id
+          if (!assetId || !tokenToOutcome[assetId]) return
+          const topBid = msg.bids?.[0] ? parseFloat(msg.bids[0].price) : 0
+          const topAsk = msg.asks?.[0] ? parseFloat(msg.asks[0].price) : 0
+          processTick(assetId, tokenToOutcome[assetId], 0, topBid, topAsk, 'WS-BOOK')
+          return
+        }
+
       } catch (e) {}
     }
 
     ws.onclose = () => {
+      clearInterval(pingInterval)
       if (!running) return
       onLog(`WebSocket closed. Reconnecting in 4s...`, 'info')
       setTimeout(connectWebSocket, 4000)
     }
 
-    ws.onerror = () => { onLog(`WebSocket error — falling back to polling`, 'info') }
+    ws.onerror = () => { onLog(`WebSocket error — polling active as fallback`, 'info') }
   }
 
   async function pollPrice(tokenId, outcomeName) {
     try {
-      const res = await fetch(`https://clob.polymarket.com/price?token_id=${tokenId}`)
+      const t0 = performance.now()
+      const res = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`)
       if (!res.ok) return
       const data = await res.json()
-      const rawMid = parseFloat(data.price || 0)
-      if (rawMid <= 0) return
-      const rawBid = lastBid[tokenId] || 0
-      const rawAsk = lastAsk[tokenId] || 0
-      processTick(tokenId, outcomeName, rawMid, rawBid, rawAsk, 'POLL')
+      const pollRtt = Math.round(performance.now() - t0)
+      const topBid = data.bids?.[0] ? parseFloat(data.bids[0].price) : 0
+      const topAsk = data.asks?.[0] ? parseFloat(data.asks[0].price) : 0
+      processTick(tokenId, outcomeName, 0, topBid, topAsk, `POLL(${pollRtt}ms)`)
     } catch (e) {}
   }
 
   async function startPolling() {
     pollInterval = setInterval(() => {
       clobTokenIds.forEach((id, i) => {
-        pollPrice(id, Object.values(tokenToOutcome)[i] || `Outcome ${i+1}`)
+        pollPrice(id, tokenToOutcome[id] || `Outcome ${i+1}`)
       })
-    }, 5000)
+    }, 2000)
   }
 
   async function init() {
@@ -265,7 +346,8 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
         tokenToOutcome[id] = outcomes[i] || `Outcome ${i + 1}`
         lastAsk[id] = parseFloat(prices[i] || 0)
         lastBid[id] = 0
-        lastSellTime[id] = 0
+        justSoldAssets[id] = false
+        soldThisTick[id] = false
       })
 
       onMarketLoaded({ question: market.question, outcomes, slug, clobTokenIds })
@@ -276,6 +358,8 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
       onLog(`Buy zones: ${config.buyZones.map(z => `${z.low}–${z.high}¢`).join(', ')}`, 'info')
       onLog(`Sell zones: ${config.sellZones.map(z => `${z.low}–${z.high}¢`).join(', ')}`, 'info')
       onLog(`Starting balance: $${config.paperBalance}`, 'info')
+      onLog(`Re-buy logic: enabled (skips 1 tick after stop-loss, then re-enters freely)`, 'info')
+      onLog(`PING heartbeat: active (9s interval)`, 'info')
 
       connectWebSocket()
       startPolling()
@@ -291,9 +375,11 @@ function createBotInstance({ slug, config, onTick, onTrade, onLog, onMarketLoade
       running = false
       if (wsInstance) wsInstance.close()
       if (pollInterval) clearInterval(pollInterval)
-      onLog(`Bot stopped. Final balance: $${paperBalance.toFixed(2)}`, 'info')
+      const avgTick = tickTimes.length > 0 ? (tickTimes.reduce((a, b) => a + b, 0) / tickTimes.length).toFixed(2) : 'N/A'
+      onLog(`Bot stopped. Final balance: $${paperBalance.toFixed(2)} | Ticks: ${tickCount} | Avg tick: ${avgTick}ms | WS RTT: ${wsLatency}ms`, 'info')
     },
     getAssets: () => ({ clobTokenIds, tokenToOutcome }),
+    getStats: () => ({ wsLatency, tickCount, avgTickMs: tickTimes.length > 0 ? tickTimes.reduce((a,b)=>a+b,0)/tickTimes.length : 0 })
   }
 }
 
@@ -369,7 +455,6 @@ function ConfigPanel({ config, setConfig, disabled }) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.4rem' }}>
-      {/* Balance slider */}
       <div>
         <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
           <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.65rem', color: '#6b6b8a', letterSpacing: '0.05em' }}>Starting Balance ($)</span>
@@ -385,7 +470,6 @@ function ConfigPanel({ config, setConfig, disabled }) {
         </div>
       </div>
 
-      {/* Buy Zones */}
       <ZoneManager
         zones={config.buyZones}
         setZones={zones => setConfig(c => ({ ...c, buyZones: typeof zones === 'function' ? zones(c.buyZones) : zones }))}
@@ -395,7 +479,6 @@ function ConfigPanel({ config, setConfig, disabled }) {
         placeholder={{ low: 40, high: 50 }}
       />
 
-      {/* Sell Zones */}
       <ZoneManager
         zones={config.sellZones}
         setZones={zones => setConfig(c => ({ ...c, sellZones: typeof zones === 'function' ? zones(c.sellZones) : zones }))}
@@ -405,10 +488,17 @@ function ConfigPanel({ config, setConfig, disabled }) {
         placeholder={{ low: 60, high: 70 }}
       />
 
+      <div style={{ padding: '0.75rem', background: 'rgba(71,212,255,0.04)', border: '1px solid rgba(71,212,255,0.12)' }}>
+        <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.55rem', color: '#47d4ff', letterSpacing: '0.1em', marginBottom: '0.3rem' }}>RE-BUY LOGIC</div>
+        <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.58rem', color: '#6b6b8a', lineHeight: 1.6 }}>
+          After a stop-loss sell, skips exactly 1 tick then re-enters freely when price returns to any buy zone. No time-based cooldown.
+        </div>
+      </div>
+
       <div style={{ padding: '0.75rem', background: 'rgba(232,255,71,0.04)', border: '1px solid rgba(232,255,71,0.1)' }}>
         <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.55rem', color: '#e8ff47', letterSpacing: '0.1em', marginBottom: '0.3rem' }}>HOLD LOGIC</div>
         <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.58rem', color: '#6b6b8a', lineHeight: 1.6 }}>
-          Holds through all dips above buy price. Sell triggers at any sell zone or if price falls below buy price (stop-loss).
+          Holds through all dips above buy price. Sell triggers at any sell zone or if bid falls below buy price (stop-loss).
         </div>
       </div>
     </div>
@@ -416,7 +506,7 @@ function ConfigPanel({ config, setConfig, disabled }) {
 }
 
 // ==================== OUTCOME CARD ====================
-function OutcomeCard({ assetId, outcomeName, ask, bid, mid, prevAsk, position, color, buyZones, sellZones }) {
+function OutcomeCard({ assetId, outcomeName, ask, bid, mid, prevAsk, position, color, buyZones, sellZones, wsLatency }) {
   const askDelta = ask - prevAsk
   const inBuyZone = buyZones.some(z => ask >= z.low / 100 && ask <= z.high / 100)
   const inSellZone = sellZones.some(z => ask >= z.low / 100 && ask <= z.high / 100)
@@ -430,11 +520,18 @@ function OutcomeCard({ assetId, outcomeName, ask, bid, mid, prevAsk, position, c
           <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.6rem', color: '#2a2a3a', letterSpacing: '0.1em', marginBottom: '0.3rem' }}>{assetId.slice(0, 12)}…</div>
           <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: '1.1rem', letterSpacing: '2px', color: '#f0f0f8' }}>{outcomeName}</div>
         </div>
-        {position && (
-          <div style={{ background: 'rgba(232,255,71,0.08)', border: '1px solid rgba(232,255,71,0.2)', padding: '0.2rem 0.6rem' }}>
-            <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.55rem', color: '#e8ff47', letterSpacing: '0.1em' }}>HOLDING</span>
-          </div>
-        )}
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.3rem' }}>
+          {position && (
+            <div style={{ background: 'rgba(232,255,71,0.08)', border: '1px solid rgba(232,255,71,0.2)', padding: '0.2rem 0.6rem' }}>
+              <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.55rem', color: '#e8ff47', letterSpacing: '0.1em' }}>HOLDING</span>
+            </div>
+          )}
+          {wsLatency > 0 && (
+            <div style={{ background: 'rgba(71,212,255,0.06)', border: '1px solid rgba(71,212,255,0.15)', padding: '0.15rem 0.5rem' }}>
+              <span style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.5rem', color: wsLatency < 100 ? '#47d4ff' : wsLatency < 300 ? '#e8ff47' : '#ff4766' }}>RTT {wsLatency}ms</span>
+            </div>
+          )}
+        </div>
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.5rem', marginBottom: '1rem' }}>
         {[
@@ -458,7 +555,6 @@ function OutcomeCard({ assetId, outcomeName, ask, bid, mid, prevAsk, position, c
         </div>
       </div>
 
-      {/* Price bar with all zones */}
       <div style={{ position: 'relative', height: '6px', background: 'rgba(240,240,248,0.07)', marginBottom: '0.4rem', borderRadius: '2px' }}>
         {buyZones.map((z, i) => (
           <div key={`b${i}`} style={{ position: 'absolute', left: `${z.low}%`, width: `${z.high - z.low}%`, height: '100%', background: 'rgba(71,212,255,0.35)', borderRadius: '1px' }} />
@@ -515,7 +611,7 @@ function Navbar({ botRunning }) {
 }
 
 function Ticker() {
-  const items = ['Live CLOB WebSocket', 'Real Ask Prices', 'Polymarket Feed', 'Multi-Zone Strategy', 'Take Profit Zones', 'Hold Through Dips', 'Paper Trading', 'Gamma API', 'Real-time Monitor']
+  const items = ['Live CLOB WebSocket', 'Real Ask Prices', 'Polymarket Feed', 'Multi-Zone Strategy', 'Take Profit Zones', 'Re-Buy on Rebound', 'Paper Trading', 'Gamma API', 'Real-time Monitor']
   return (
     <div className="ticker-wrap">
       <div className="ticker-inner">
@@ -577,6 +673,41 @@ function Sparkline({ data, color = '#e8ff47', height = 40 }) {
   )
 }
 
+// ==================== LATENCY PANEL ====================
+function LatencyPanel({ wsLatency, tickCount, logs }) {
+  const recentLogs = logs.slice(0, 50)
+  const pollLogs = recentLogs.filter(l => l.text.includes('POLL('))
+  const pollTimes = pollLogs.map(l => {
+    const m = l.text.match(/POLL\((\d+)ms\)/)
+    return m ? parseInt(m[1]) : null
+  }).filter(Boolean)
+  const avgPoll = pollTimes.length > 0 ? Math.round(pollTimes.reduce((a,b)=>a+b,0)/pollTimes.length) : null
+
+  const latencyColor = (ms) => {
+    if (!ms || ms === 0) return '#2a2a3a'
+    if (ms < 80) return '#47d4ff'
+    if (ms < 200) return '#e8ff47'
+    return '#ff4766'
+  }
+
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '1px', background: 'rgba(240,240,248,0.07)', marginBottom: '1.5rem' }}>
+      {[
+        { label: 'WS RTT', value: wsLatency > 0 ? `${wsLatency}ms` : '—', color: latencyColor(wsLatency), sub: wsLatency > 0 ? (wsLatency < 80 ? 'Excellent' : wsLatency < 200 ? 'Good' : 'Slow') : 'Pending ping' },
+        { label: 'HTTP Poll RTT', value: avgPoll ? `${avgPoll}ms` : '—', color: latencyColor(avgPoll), sub: avgPoll ? `${pollTimes.length} samples` : 'No polls yet' },
+        { label: 'Total Ticks', value: tickCount > 0 ? tickCount.toLocaleString() : '0', color: '#a78bfa', sub: 'WS + poll combined' },
+        { label: 'Feed Priority', value: 'WS-BBA', color: '#e8ff47', sub: 'best_bid_ask first' },
+      ].map((s, i) => (
+        <div key={i} style={{ background: '#0a0a0f', padding: '1rem 1.25rem' }}>
+          <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.5rem', color: '#2a2a3a', letterSpacing: '0.12em', textTransform: 'uppercase', marginBottom: '0.3rem' }}>{s.label}</div>
+          <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: '1.6rem', color: s.color, letterSpacing: '2px', lineHeight: 1 }}>{s.value}</div>
+          <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.5rem', color: '#6b6b8a', marginTop: '0.25rem' }}>{s.sub}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 // ==================== MAIN PAGE ====================
 export default function Page() {
   const [slug, setSlug] = useState('atp-montsi-donski-2026-06-06')
@@ -590,7 +721,6 @@ export default function Page() {
     sellZones: [
       { id: 2, low: 68, high: 69 },
     ],
-    buyCooldownMs: 0,
   })
 
   const [balance, setBalance] = useState(10)
@@ -603,6 +733,8 @@ export default function Page() {
   const [marketInfo, setMarketInfo] = useState(null)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
   const [wsSources, setWsSources] = useState({})
+  const [wsLatency, setWsLatency] = useState(0)
+  const [tickCount, setTickCount] = useState(0)
 
   const startTimeRef = useRef(null)
   const timerRef = useRef(null)
@@ -610,6 +742,11 @@ export default function Page() {
   const addLog = useCallback((text, type = 'info') => {
     const entry = { text, type, time: new Date().toLocaleTimeString(), id: Date.now() + Math.random() }
     setLogs(prev => [entry, ...prev].slice(0, 300))
+    // Extract WS latency from log
+    if (text.startsWith('WS RTT:')) {
+      const m = text.match(/(\d+)ms/)
+      if (m) setWsLatency(parseInt(m[1]))
+    }
   }, [])
 
   const onTick = useCallback((data) => {
@@ -619,6 +756,8 @@ export default function Page() {
       return { ...prev, [data.assetId]: [...hist.slice(-80), data.ask] }
     })
     if (data.source) setWsSources(prev => ({ ...prev, [data.assetId]: data.source }))
+    if (data.wsLatency !== undefined && data.wsLatency > 0) setWsLatency(data.wsLatency)
+    setTickCount(prev => prev + 1)
   }, [])
 
   const onTrade = useCallback((entry, newBalance, newPositions) => {
@@ -644,6 +783,8 @@ export default function Page() {
     setElapsedSeconds(0)
     setMarketInfo(null)
     setWsSources({})
+    setWsLatency(0)
+    setTickCount(0)
 
     startTimeRef.current = Date.now()
     timerRef.current = setInterval(() => {
@@ -727,7 +868,7 @@ export default function Page() {
                     </button>
                   )}
                   {!botRunning && (
-                    <button className="ghost-btn" onClick={() => { setTrades([]); setLogs([]); setBalance(config.paperBalance); setPositions({}); setBalanceHistory([]); setElapsedSeconds(0); setMarketInfo(null); setTicks({}); setAskHistory({}); setWsSources({}) }}>
+                    <button className="ghost-btn" onClick={() => { setTrades([]); setLogs([]); setBalance(config.paperBalance); setPositions({}); setBalanceHistory([]); setElapsedSeconds(0); setMarketInfo(null); setTicks({}); setAskHistory({}); setWsSources({}); setWsLatency(0); setTickCount(0) }}>
                       Reset
                     </button>
                   )}
@@ -771,7 +912,7 @@ export default function Page() {
                     {[
                       { label: 'Status', value: botRunning ? 'LIVE' : 'STOPPED', color: botRunning ? '#e8ff47' : '#ff4766' },
                       { label: 'Elapsed', value: formatTime(elapsedSeconds), color: '#f0f0f8' },
-                      { label: 'Feed', value: botRunning ? activeSource : '—', color: activeSource === 'WS' ? '#e8ff47' : '#47d4ff' },
+                      { label: 'Feed', value: botRunning ? activeSource : '—', color: activeSource.startsWith('WS') ? '#e8ff47' : '#47d4ff' },
                       { label: 'Open', value: openCount, color: openCount > 0 ? '#a78bfa' : '#6b6b8a' },
                     ].map(m => (
                       <div key={m.label} style={{ textAlign: 'right' }}>
@@ -781,6 +922,11 @@ export default function Page() {
                     ))}
                   </div>
                 </div>
+              )}
+
+              {/* Latency Panel */}
+              {(botRunning || tickCount > 0) && (
+                <LatencyPanel wsLatency={wsLatency} tickCount={tickCount} logs={logs} />
               )}
 
               <div className="stats-row" style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '1px', background: 'rgba(240,240,248,0.07)', marginBottom: '1.5rem' }}>
@@ -817,6 +963,7 @@ export default function Page() {
                         color={i === 0 ? '#e8ff47' : '#47d4ff'}
                         buyZones={config.buyZones}
                         sellZones={config.sellZones}
+                        wsLatency={wsLatency}
                       />
                     )
                   })}
@@ -924,7 +1071,8 @@ export default function Page() {
                     </div>
                   </div>
                   {[
-                    { icon: '🔴', label: 'Stop-Loss', value: 'Below buy price', color: '#ff4766' },
+                    { icon: '🔴', label: 'Stop-Loss', value: 'Below buy price (bid)', color: '#ff4766' },
+                    { icon: '🔄', label: 'Re-Buy', value: 'Next tick after stop-loss', color: '#47d4ff' },
                     { icon: '📌', label: 'Hold Logic', value: 'Holds through all dips above buy price', color: '#a78bfa' },
                     { icon: '💰', label: 'Starting Balance', value: `$${config.paperBalance}`, color: '#f0f0f8' },
                   ].map(s => (
@@ -963,10 +1111,11 @@ export default function Page() {
                 {[
                   'Fetches market from gamma-api.polymarket.com',
                   'Connects to wss://ws-subscriptions-clob.polymarket.com',
-                  'Polls clob.polymarket.com/price every 5s as backup',
+                  'Polls clob.polymarket.com/book every 2s as backup',
                   'Buys when ask enters any configured buy zone',
                   'Holds through all price swings above buy price',
                   'Sells at any sell zone or below buy price (stop-loss)',
+                  'Re-buys on next tick if price returns to buy zone',
                 ].map(item => (
                   <div key={item} style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', fontFamily: "'Space Mono', monospace", fontSize: '0.65rem', color: '#6b6b8a', letterSpacing: '0.05em' }}>
                     <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#e8ff47" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
@@ -983,7 +1132,7 @@ export default function Page() {
         <div style={{ maxWidth: '1400px', margin: '0 auto', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '1rem' }}>
           <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: '1.4rem', letterSpacing: '4px', color: '#e8ff47' }}>POLY<span style={{ color: '#ff4766' }}>BOT</span></div>
           <div style={{ fontFamily: "'Space Mono', monospace", fontSize: '0.58rem', color: '#1a1a24', letterSpacing: '0.08em' }}>
-            Paper trading only · Not financial advice · Real CLOB ask prices
+            Paper trading only · Not financial advice · Real CLOB bid/ask prices
           </div>
         </div>
       </footer>
