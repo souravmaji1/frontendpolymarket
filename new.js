@@ -22,10 +22,10 @@ function getArg(key, defaultVal) {
 // ==================== CONFIG ====================
 const config = {
   paperBalance:  getArg('balance',  10),
-  buyZoneLow:    getArg('buyLow',   0.62),
-  buyZoneHigh:   getArg('buyHigh',  0.64),
-  sellZoneLow:   getArg('sellLow',  0.68),
-  sellZoneHigh:  getArg('sellHigh', 0.69),
+  buyZoneLow:    getArg('buyLow',   0.62) / 100,   // <-- divide by 100
+  buyZoneHigh:   getArg('buyHigh',  0.64) / 100,   // <-- divide by 100
+  sellZoneLow:   getArg('sellLow',  0.68) / 100,   // <-- divide by 100
+  sellZoneHigh:  getArg('sellHigh', 0.69) / 100,   // <-- divide by 100
   buyCooldownMs: getArg('cooldown', 0),
 };
 
