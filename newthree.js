@@ -43,22 +43,22 @@ let clobTokenIds = [];
 let trades = [];
 let startTime = Date.now();
 let tradeCounter = 0;
-
-// Track latency
-let lastTickTime = {};
 let wsLatencies = [];
+
+// last trade snapshot for inline display
+let lastTradeSnap = null;
 
 // ==================== COLORS ====================
 const C = {
-  reset:  '\x1b[0m',
-  grey:   '\x1b[90m',
-  white:  '\x1b[37m',
-  green:  '\x1b[32m',
-  red:    '\x1b[31m',
-  yellow: '\x1b[33m',
-  cyan:   '\x1b[36m',
-  magenta:'\x1b[35m',
-  bold:   '\x1b[1m',
+  reset:   '\x1b[0m',
+  grey:    '\x1b[90m',
+  white:   '\x1b[37m',
+  green:   '\x1b[32m',
+  red:     '\x1b[31m',
+  yellow:  '\x1b[33m',
+  cyan:    '\x1b[36m',
+  magenta: '\x1b[35m',
+  bold:    '\x1b[1m',
 };
 
 // ==================== LOGGING ====================
@@ -81,6 +81,7 @@ function pad(str, len, right = false) {
   return s.padEnd(len);
 }
 
+// ==================== LIVE SUMMARY WITH LAST TRADE PANEL ====================
 function printLiveSummary() {
   const realizedPnL = trades
     .filter(t => t.type === 'SELL')
@@ -93,20 +94,69 @@ function printLiveSummary() {
   const mm = String(Math.floor(elapsed / 60)).padStart(2, '0');
   const ss = String(elapsed % 60).padStart(2, '0');
   const avgLatency = wsLatencies.length > 0
-    ? (wsLatencies.slice(-20).reduce((a,b) => a+b, 0) / Math.min(wsLatencies.length, 20)).toFixed(0) + 'ms'
+    ? (wsLatencies.slice(-20).reduce((a, b) => a + b, 0) / Math.min(wsLatencies.length, 20)).toFixed(0) + 'ms'
     : '--';
 
-  console.log(`\n${C.grey}─────────────────────────────────────────${C.reset}`);
-  console.log(`${C.white} Balance:    ${C.green}$${paperBalance.toFixed(2)}${C.reset}  (started $${config.paperBalance})`);
-  console.log(`${C.white} Realized:   ${realizedPnL >= 0 ? C.cyan : C.red}${realizedPnL >= 0 ? '+' : ''}$${realizedPnL.toFixed(4)}${C.reset}`);
-  console.log(`${C.white} Win Rate:   ${C.yellow}${winRate}${C.reset}  (${wins}W / ${losses}L)`);
-  console.log(`${C.white} Open Pos:   ${C.magenta}${openCount}${C.reset}`);
-  console.log(`${C.white} Runtime:    ${C.grey}${mm}:${ss}${C.reset}`);
-  console.log(`${C.white} Trades:     ${C.grey}${trades.length}${C.reset}`);
-  console.log(`${C.white} Avg WS Lat: ${C.grey}${avgLatency}${C.reset}`);
-  console.log(`${C.grey}─────────────────────────────────────────${C.reset}\n`);
+  // ── left column: session stats ──
+  const left = [
+    `${C.white} Balance  : ${C.green}$${paperBalance.toFixed(4)}${C.reset}  (started $${config.paperBalance})`,
+    `${C.white} Realized : ${realizedPnL >= 0 ? C.cyan : C.red}${realizedPnL >= 0 ? '+' : ''}$${realizedPnL.toFixed(4)}${C.reset}`,
+    `${C.white} Win Rate : ${C.yellow}${winRate}${C.reset}  (${wins}W / ${losses}L)`,
+    `${C.white} Open Pos : ${C.magenta}${openCount}${C.reset}`,
+    `${C.white} Runtime  : ${C.grey}${mm}:${ss}${C.reset}`,
+    `${C.white} Trades   : ${C.grey}${trades.length}${C.reset}`,
+    `${C.white} Avg Lat  : ${C.grey}${avgLatency}${C.reset}`,
+  ];
+
+  // ── right column: last trade panel ──
+  let right = [];
+  if (lastTradeSnap) {
+    const t = lastTradeSnap;
+    const isBuy  = t.type === 'BUY';
+    const isWin  = !isBuy && t.pnl >= 0;
+    const typeColor = isBuy ? C.cyan : (isWin ? C.green : C.red);
+    const typeLabel = isBuy ? '  BUY  ' : (isWin ? 'SELL WIN' : 'SELL LOSS');
+    const latStr = t.latencyMs != null ? `${t.latencyMs}ms` : '--';
+    const pnlStr = isBuy
+      ? `${C.grey}—${C.reset}`
+      : `${isWin ? C.green : C.red}${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(4)}${C.reset}`;
+
+    right = [
+      `${C.grey}┌─── LAST TRADE ──────────────────────┐${C.reset}`,
+      `${C.grey}│${C.reset} Type     : ${typeColor}${typeLabel}${C.reset}`,
+      `${C.grey}│${C.reset} Outcome  : ${C.white}${t.outcome.substring(0, 22)}${C.reset}`,
+      `${C.grey}│${C.reset} Shares   : ${C.white}${t.shares.toFixed(6)}${C.reset}`,
+      `${C.grey}│${C.reset} Buy @    : ${C.white}${(t.buyAsk * 100).toFixed(2)}¢${C.reset}`,
+      `${C.grey}│${C.reset} Sell @   : ${isBuy ? `${C.grey}—${C.reset}` : `${C.white}${(t.sellAsk * 100).toFixed(2)}¢${C.reset}`}`,
+      `${C.grey}│${C.reset} P&L      : ${pnlStr}`,
+      `${C.grey}│${C.reset} Latency  : ${C.yellow}${latStr}${C.reset}`,
+      `${C.grey}│${C.reset} Time     : ${C.grey}${t.time}${C.reset}`,
+      `${C.grey}│${C.reset} Balance  : ${C.green}$${t.balanceAfter.toFixed(4)}${C.reset}`,
+      `${C.grey}└─────────────────────────────────────┘${C.reset}`,
+    ];
+  } else {
+    right = [
+      `${C.grey}┌─── LAST TRADE ──────────────────────┐${C.reset}`,
+      `${C.grey}│${C.reset}  No trades yet...                   ${C.grey}│${C.reset}`,
+      `${C.grey}└─────────────────────────────────────┘${C.reset}`,
+    ];
+  }
+
+  // ── render side by side ──
+  console.log(`\n${C.grey}─────────────────────────────────────────────────────────────────────────${C.reset}`);
+  const maxRows = Math.max(left.length, right.length);
+  for (let i = 0; i < maxRows; i++) {
+    const l = left[i]  || '';
+    const r = right[i] || '';
+    // strip ansi for padding calculation
+    const lClean = l.replace(/\x1b\[[0-9;]*m/g, '');
+    const pad = 42 - lClean.length;
+    console.log(`${l}${' '.repeat(Math.max(pad, 2))}${r}`);
+  }
+  console.log(`${C.grey}─────────────────────────────────────────────────────────────────────────${C.reset}\n`);
 }
 
+// ==================== FINAL REPORT ====================
 function printFinalReport() {
   const elapsed = Math.floor((Date.now() - startTime) / 1000);
   const mm = String(Math.floor(elapsed / 60)).padStart(2, '0');
@@ -116,71 +166,64 @@ function printFinalReport() {
   console.log(`${C.bold}${C.yellow}  FINAL TRADE REPORT${C.reset}`);
   console.log(`${C.yellow}${'═'.repeat(110)}${C.reset}`);
 
-  // ── Header ──
   const hdr = [
-    pad('#',    4),
-    pad('Time',     10),
-    pad('Type',      9),
-    pad('Outcome',  18),
-    pad('Shares',   10, true),
-    pad('Buy¢',      7, true),
-    pad('Sell¢',     7, true),
-    pad('Cost($)',   9, true),
-    pad('Proceeds',  10, true),
-    pad('P&L($)',    9, true),
-    pad('Balance',   9, true),
-    pad('Latency',   9, true),
-    pad('Reason',   20),
+    pad('#',        4),
+    pad('Time',    10),
+    pad('Type',    10),
+    pad('Outcome', 18),
+    pad('Shares',  10, true),
+    pad('Buy¢',     8, true),
+    pad('Sell¢',    8, true),
+    pad('Cost($)',  9, true),
+    pad('Proceeds', 10, true),
+    pad('P&L($)',   10, true),
+    pad('Balance',  10, true),
+    pad('Latency',  9, true),
+    pad('Reason',  22),
   ].join('  ');
   console.log(`${C.grey}  ${hdr}${C.reset}`);
   console.log(`${C.grey}  ${'─'.repeat(108)}${C.reset}`);
 
-  // ── Rows ──
-  let runningBalance = config.paperBalance;
+  let runningBal = config.paperBalance;
   for (const t of trades) {
-    let color = C.grey;
-    let typeLabel = t.type;
+    const isBuy = t.type === 'BUY';
+    const isWin = !isBuy && t.pnl >= 0;
+    const color = isBuy ? C.cyan : (isWin ? C.green : C.red);
+    const typeLabel = isBuy ? 'BUY' : (isWin ? 'SELL WIN' : 'SELL LOSS');
 
-    if (t.type === 'BUY') {
-      color = C.cyan;
-      runningBalance -= t.cost;
-    } else {
-      color = t.pnl >= 0 ? C.green : C.red;
-      typeLabel = t.pnl >= 0 ? 'SELL WIN' : 'SELL LOSS';
-      runningBalance += t.proceeds;
-    }
+    if (isBuy) runningBal -= t.cost;
+    else        runningBal += t.proceeds;
 
     const row = [
-      pad(t.id,           4),
-      pad(t.time,        10),
-      pad(typeLabel,      9),
-      pad(t.outcome.substring(0, 17), 18),
-      pad(t.shares.toFixed(4),        10, true),
-      pad(t.type === 'BUY'  ? (t.buyAsk * 100).toFixed(2)  : (t.buyAsk * 100).toFixed(2),  7, true),
-      pad(t.type === 'SELL' ? (t.sellAsk * 100).toFixed(2) : '—',                           7, true),
-      pad(t.type === 'BUY'  ? t.cost.toFixed(4)            : '—',                           9, true),
-      pad(t.type === 'SELL' ? t.proceeds.toFixed(4)        : '—',                          10, true),
-      pad(t.type === 'SELL' ? (t.pnl >= 0 ? '+' : '') + t.pnl.toFixed(4) : '—',           9, true),
-      pad('$' + runningBalance.toFixed(4),                                                   9, true),
-      pad(t.latencyMs != null ? t.latencyMs + 'ms' : '--',                                  9, true),
-      pad((t.reason || '').substring(0, 20),                                               20),
+      pad(t.id,                                                          4),
+      pad(t.time,                                                       10),
+      pad(typeLabel,                                                    10),
+      pad(t.outcome.substring(0, 17),                                  18),
+      pad(t.shares.toFixed(6),                                         10, true),
+      pad((t.buyAsk * 100).toFixed(2),                                  8, true),
+      pad(isBuy ? '—' : (t.sellAsk * 100).toFixed(2),                  8, true),
+      pad(isBuy ? t.cost.toFixed(4) : '—',                             9, true),
+      pad(isBuy ? '—' : t.proceeds.toFixed(4),                        10, true),
+      pad(isBuy ? '—' : (t.pnl >= 0 ? '+' : '') + t.pnl.toFixed(4),  10, true),
+      pad('$' + runningBal.toFixed(4),                                 10, true),
+      pad(t.latencyMs != null ? t.latencyMs + 'ms' : '--',             9, true),
+      pad((t.reason || '').substring(0, 22),                          22),
     ].join('  ');
 
     console.log(`${color}  ${row}${C.reset}`);
   }
 
-  // ── Totals ──
-  const sellTrades = trades.filter(t => t.type === 'SELL');
-  const realizedPnL  = sellTrades.reduce((s, t) => s + t.pnl, 0);
-  const totalCost    = trades.filter(t => t.type === 'BUY').reduce((s, t) => s + t.cost, 0);
-  const totalProc    = sellTrades.reduce((s, t) => s + t.proceeds, 0);
-  const wins         = sellTrades.filter(t => t.pnl >= 0).length;
-  const losses       = sellTrades.filter(t => t.pnl < 0).length;
-  const winRate      = (wins + losses) > 0 ? ((wins / (wins + losses)) * 100).toFixed(1) + '%' : '--';
-  const avgWin       = wins   > 0 ? (sellTrades.filter(t=>t.pnl>=0).reduce((s,t)=>s+t.pnl,0)/wins).toFixed(4)  : '--';
-  const avgLoss      = losses > 0 ? (sellTrades.filter(t=>t.pnl<0).reduce((s,t)=>s+t.pnl,0)/losses).toFixed(4) : '--';
-  const avgLat       = wsLatencies.length > 0
-    ? (wsLatencies.reduce((a,b)=>a+b,0)/wsLatencies.length).toFixed(0)+'ms' : '--';
+  const sellTrades  = trades.filter(t => t.type === 'SELL');
+  const realizedPnL = sellTrades.reduce((s, t) => s + t.pnl, 0);
+  const totalCost   = trades.filter(t => t.type === 'BUY').reduce((s, t) => s + t.cost, 0);
+  const totalProc   = sellTrades.reduce((s, t) => s + t.proceeds, 0);
+  const wins        = sellTrades.filter(t => t.pnl >= 0).length;
+  const losses      = sellTrades.filter(t => t.pnl < 0).length;
+  const winRate     = (wins + losses) > 0 ? ((wins / (wins + losses)) * 100).toFixed(1) + '%' : '--';
+  const avgWin      = wins   > 0 ? (sellTrades.filter(t => t.pnl >= 0).reduce((s, t) => s + t.pnl, 0) / wins).toFixed(4)  : '--';
+  const avgLoss     = losses > 0 ? (sellTrades.filter(t => t.pnl < 0).reduce((s, t) => s + t.pnl, 0) / losses).toFixed(4) : '--';
+  const avgLat      = wsLatencies.length > 0
+    ? (wsLatencies.reduce((a, b) => a + b, 0) / wsLatencies.length).toFixed(0) + 'ms' : '--';
 
   console.log(`${C.grey}  ${'─'.repeat(108)}${C.reset}`);
   console.log(`\n${C.yellow}  SUMMARY${C.reset}`);
@@ -188,7 +231,7 @@ function printFinalReport() {
   console.log(`${C.white}  Total Cost    : ${C.red}-$${totalCost.toFixed(4)}${C.reset}`);
   console.log(`${C.white}  Total Proceeds: ${C.green}+$${totalProc.toFixed(4)}${C.reset}`);
   console.log(`${C.white}  Realized P&L  : ${realizedPnL >= 0 ? C.green : C.red}${realizedPnL >= 0 ? '+' : ''}$${realizedPnL.toFixed(4)}${C.reset}`);
-  console.log(`${C.white}  Trades        : ${trades.length} total  (${trades.filter(t=>t.type==='BUY').length} buys / ${sellTrades.length} sells)`);
+  console.log(`${C.white}  Trades        : ${trades.length} total  (${trades.filter(t => t.type === 'BUY').length} buys / ${sellTrades.length} sells)`);
   console.log(`${C.white}  Win Rate      : ${C.yellow}${winRate}${C.reset}  (${wins}W / ${losses}L)`);
   console.log(`${C.white}  Avg Win       : ${C.green}+$${avgWin}${C.reset}`);
   console.log(`${C.white}  Avg Loss      : ${C.red}$${avgLoss}${C.reset}`);
@@ -205,8 +248,8 @@ function tryBuy(assetId, outcomeName, ask, latencyMs) {
   if (cooldown > 0) return;
 
   if (ask >= config.buyZoneLow && ask <= config.buyZoneHigh) {
-    const cost    = 1.00;                 // always spend exactly $1
-    const shares  = cost / ask;           // shares received for $1
+    const cost   = 1.00;
+    const shares = cost / ask;
     if (paperBalance < cost) return;
 
     paperBalance -= cost;
@@ -214,24 +257,26 @@ function tryBuy(assetId, outcomeName, ask, latencyMs) {
 
     tradeCounter++;
     const entry = {
-      id:        tradeCounter,
-      type:      'BUY',
-      outcome:   outcomeName,
+      id:          tradeCounter,
+      type:        'BUY',
+      outcome:     outcomeName,
       shares,
-      buyAsk:    ask,
-      sellAsk:   null,
+      buyAsk:      ask,
+      sellAsk:     null,
       cost,
-      proceeds:  null,
-      pnl:       null,
+      proceeds:    null,
+      pnl:         null,
       balanceAfter: paperBalance,
-      time:      new Date().toLocaleTimeString(),
+      time:        new Date().toLocaleTimeString(),
       assetId,
-      latencyMs: latencyMs != null ? latencyMs : null,
-      reason:    'Buy zone hit',
+      latencyMs:   latencyMs ?? null,
+      reason:      'Buy zone hit',
     };
     trades.push(entry);
+    lastTradeSnap = entry;
+
     log(
-      `BUY  ${outcomeName} | Ask@${(ask*100).toFixed(2)}¢ | ${shares.toFixed(4)}sh | cost $${cost.toFixed(2)} | lat:${latencyMs != null ? latencyMs+'ms' : '--'} | bal $${paperBalance.toFixed(2)}`,
+      `BUY  ${outcomeName} | Ask@${(ask*100).toFixed(2)}¢ | ${shares.toFixed(6)}sh | cost $${cost.toFixed(2)} | lat:${latencyMs != null ? latencyMs+'ms' : '--'} | bal $${paperBalance.toFixed(4)}`,
       'buy'
     );
     printLiveSummary();
@@ -246,64 +291,63 @@ function trySell(assetId, ask, latencyMs) {
   let shouldSell = false;
   let sellReason = '';
 
-  // === IMPROVED STOPLOSS ===
-  if (ask <= pos.buyAsk - 0.005) {   // ← New condition (this is the replacement)
+  if (ask < pos.buyAsk) {
     shouldSell = true;
-    sellReason = `Hard Stop ${(pos.buyAsk*100).toFixed(2)}→${(ask*100).toFixed(2)}¢`;
+    sellReason = `StopLoss ${(pos.buyAsk*100).toFixed(2)}→${(ask*100).toFixed(2)}¢`;
   }
-
   if (!shouldSell && ask >= config.sellZoneLow && ask <= config.sellZoneHigh) {
     shouldSell = true;
     sellReason = `Target ${(ask*100).toFixed(2)}¢`;
   }
-
   if (!shouldSell) return;
 
   const proceeds = pos.shares * ask;
-  const cost     = pos.shares * pos.buyAsk;   // what we originally paid (= $1)
+  const cost     = pos.shares * pos.buyAsk;
   const pnl      = proceeds - cost;
-  paperBalance += proceeds;
+  paperBalance  += proceeds;
   lastSellTime[assetId] = Date.now();
 
   tradeCounter++;
   const entry = {
-    id:        tradeCounter,
-    type:      'SELL',
-    outcome:   pos.outcomeName,
-    shares:    pos.shares,
-    buyAsk:    pos.buyAsk,
-    sellAsk:   ask,
+    id:          tradeCounter,
+    type:        'SELL',
+    outcome:     pos.outcomeName,
+    shares:      pos.shares,
+    buyAsk:      pos.buyAsk,
+    sellAsk:     ask,
     cost,
     proceeds,
     pnl,
     balanceAfter: paperBalance,
-    time:      new Date().toLocaleTimeString(),
+    time:        new Date().toLocaleTimeString(),
     assetId,
-    latencyMs: latencyMs != null ? latencyMs : null,
-    reason:    sellReason,
+    latencyMs:   latencyMs ?? null,
+    reason:      sellReason,
   };
   trades.push(entry);
+  lastTradeSnap = entry;
   delete positions[assetId];
 
   const type = pnl >= 0 ? 'sell_win' : 'sell_loss';
   const icon = pnl >= 0 ? 'SELL WIN ' : 'SELL LOSS';
   log(
-    `${icon} ${pos.outcomeName} | ${(pos.buyAsk*100).toFixed(2)}¢→${(ask*100).toFixed(2)}¢ | P&L ${pnl>=0?'+':''}$${pnl.toFixed(4)} | lat:${latencyMs!=null?latencyMs+'ms':'--'} | bal $${paperBalance.toFixed(2)} | ${sellReason}`,
+    `${icon} ${pos.outcomeName} | ${(pos.buyAsk*100).toFixed(2)}¢→${(ask*100).toFixed(2)}¢ | P&L ${pnl>=0?'+':''}$${pnl.toFixed(4)} | lat:${latencyMs != null ? latencyMs+'ms' : '--'} | bal $${paperBalance.toFixed(4)} | ${sellReason}`,
     type
   );
   printLiveSummary();
 }
 
+// ==================== TICK ====================
 function processTick(assetId, outcomeName, rawBid, rawAsk, source, latencyMs) {
   const bid = rawBid > 0 ? rawBid : (lastBid[assetId] || 0);
   const ask = rawAsk > 0 ? rawAsk : (lastAsk[assetId] || 0);
-  if (bid > 0) lastBid[assetId]  = bid;
-  if (ask > 0) lastAsk[assetId]  = ask;
+  if (bid > 0) lastBid[assetId] = bid;
+  if (ask > 0) lastAsk[assetId] = ask;
 
   const hadPosition = !!positions[assetId];
 
   log(
-    `[${source}]${latencyMs!=null?' lat:'+latencyMs+'ms':''} ${outcomeName} | Ask:${ask>0?(ask*100).toFixed(2)+'¢':'N/A'} | Bid:${bid>0?(bid*100).toFixed(2)+'¢':'N/A'}`,
+    `[${source}]${latencyMs != null ? ' lat:' + latencyMs + 'ms' : ''} ${outcomeName} | Ask:${ask > 0 ? (ask*100).toFixed(2)+'¢' : 'N/A'} | Bid:${bid > 0 ? (bid*100).toFixed(2)+'¢' : 'N/A'}`,
     'info'
   );
 
@@ -331,14 +375,11 @@ function connectWebSocket() {
     const recvTime = Date.now();
     try {
       const msg = JSON.parse(data.toString());
-
-      // measure latency if timestamp present
       let latencyMs = null;
       if (msg.timestamp) {
-        latencyMs = recvTime - parseInt(msg.timestamp);
-        if (latencyMs >= 0 && latencyMs < 30000) wsLatencies.push(latencyMs);
+        const tl = recvTime - parseInt(msg.timestamp);
+        if (tl >= 0 && tl < 30000) { latencyMs = tl; wsLatencies.push(tl); }
       }
-
       const priceChanges = msg.price_changes || [];
       for (const change of priceChanges) {
         const assetId = change.asset_id;
@@ -346,14 +387,11 @@ function connectWebSocket() {
         const outcomeName = tokenToOutcome[assetId];
         const rawBid = parseFloat(change.best_bid || 0);
         const rawAsk = parseFloat(change.best_ask || 0);
-
-        // per-asset latency from change.timestamp if available
         let tickLat = latencyMs;
         if (change.timestamp) {
           const tl = recvTime - parseInt(change.timestamp);
           if (tl >= 0 && tl < 30000) { tickLat = tl; wsLatencies.push(tl); }
         }
-
         processTick(assetId, outcomeName, rawBid, rawAsk, 'WS', tickLat);
       }
     } catch (e) {}
@@ -380,17 +418,14 @@ async function pollPrice(tokenId, outcomeName) {
     const latencyMs = Date.now() - t0;
     const rawMid = parseFloat(data.price || 0);
     if (rawMid <= 0) return;
-    const rawBid = lastBid[tokenId] || 0;
-    const rawAsk = lastAsk[tokenId] || 0;
-    processTick(tokenId, outcomeName, rawBid, rawAsk, 'POLL', latencyMs);
+    processTick(tokenId, outcomeName, lastBid[tokenId] || 0, lastAsk[tokenId] || 0, 'POLL', latencyMs);
   } catch (e) {}
 }
 
 function startPolling() {
   pollInterval = setInterval(() => {
     clobTokenIds.forEach((id, i) => {
-      const outcomeName = tokenToOutcome[id] || `Outcome ${i + 1}`;
-      pollPrice(id, outcomeName);
+      pollPrice(id, tokenToOutcome[id] || `Outcome ${i + 1}`);
     });
   }, 5000);
 }
@@ -411,11 +446,11 @@ async function init() {
       return [];
     };
 
-    clobTokenIds  = safeParse(market.clobTokenIds);
-    const prices  = safeParse(market.outcomePrices);
-    const outcomes = safeParse(market.outcomes);
+    clobTokenIds        = safeParse(market.clobTokenIds);
+    const prices        = safeParse(market.outcomePrices);
+    const outcomes      = safeParse(market.outcomes);
 
-    if (clobTokenIds.length === 0) throw new Error('No CLOB token IDs found for this market');
+    if (clobTokenIds.length === 0) throw new Error('No CLOB token IDs found');
 
     clobTokenIds.forEach((id, i) => {
       tokenToOutcome[id] = outcomes[i] || `Outcome ${i + 1}`;
@@ -426,15 +461,9 @@ async function init() {
 
     log(`Market: ${market.question}`, 'info');
     log(`Outcomes: ${outcomes.join(' vs ')}`, 'info');
-    log(`Assets: ${clobTokenIds.length} token(s) found`, 'info');
-    log(
-      `Initial prices: ${prices.map((p, i) => `${outcomes[i]||i}: ${(parseFloat(p)*100).toFixed(2)}¢`).join(' | ')}`,
-      'info'
-    );
-    log(
-      `Strategy: BUY ${(config.buyZoneLow*100).toFixed(2)}–${(config.buyZoneHigh*100).toFixed(2)}¢ | SELL ${(config.sellZoneLow*100).toFixed(2)}–${(config.sellZoneHigh*100).toFixed(2)}¢`,
-      'info'
-    );
+    log(`Assets: ${clobTokenIds.length} token(s)`, 'info');
+    log(`Initial prices: ${prices.map((p, i) => `${outcomes[i]||i}: ${(parseFloat(p)*100).toFixed(2)}¢`).join(' | ')}`, 'info');
+    log(`Strategy: BUY ${(config.buyZoneLow*100).toFixed(2)}–${(config.buyZoneHigh*100).toFixed(2)}¢ | SELL ${(config.sellZoneLow*100).toFixed(2)}–${(config.sellZoneHigh*100).toFixed(2)}¢`, 'info');
     log(`Starting balance: $${config.paperBalance}`, 'info');
 
     connectWebSocket();
@@ -445,12 +474,12 @@ async function init() {
   }
 }
 
-// ==================== GRACEFUL SHUTDOWN ====================
+// ==================== SHUTDOWN ====================
 function stop() {
   running = false;
   if (wsInstance) wsInstance.close();
   if (pollInterval) clearInterval(pollInterval);
-  log(`Bot stopped.`, 'info');
+  log('Bot stopped.', 'info');
   printFinalReport();
   process.exit(0);
 }
