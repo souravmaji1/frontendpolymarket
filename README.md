@@ -1,3 +1,13 @@
 ssh root@82.22.32.13
 
-it need to show in the console as well whenever it buys share also why it didn't buy the share when i set the buylow to 81 showing this in the console 
+atp-shelton-shimabu-2026-06-12
+
+
+─────────────────────────────────────────
+ Balance:    $9.70  (started $10)
+ Realized:   $-0.21
+ Win Rate:   7%  (3W / 41L)
+ Open Pos:   0
+ Runtime:    92:43
+ Trades:     88
+─────────────────────────────────────────
