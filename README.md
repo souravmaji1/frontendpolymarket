@@ -80,3 +80,10 @@ root@FXVPS160764:~/frontendpolymarket#
 ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 PS D:\tradepolymarket> 
+
+
+atp-sonego-basilas-2026-06-14
+
+node newtwo.js atp-sonego-basilas-2026-06-14 --buyLow=80 --buyHigh=80 --sellLow=89 --sellHigh=95 --stopLoss=80 --slippage=1 --cooldown=0
+
+node latest.js atp-shelton-fritz-2026-06-14 --buyLow=80 --buyHigh=80 --sellLow=89 --sellHigh=95 --cooldown=0 --stopTicks=3 --maxDips=5 --hardStop=5 --trailActivate=3 --trailDrop=1.5 --maxHold=0 --reentryDip=2

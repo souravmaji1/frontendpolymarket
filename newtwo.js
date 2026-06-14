@@ -247,7 +247,7 @@ function trySell(assetId, ask, latencyMs) {
   let sellReason = '';
 
   // === IMPROVED STOPLOSS ===
-  if (ask <= pos.buyAsk - 0.005) {   // ← New condition (this is the replacement)
+  if (ask <= pos.buyAsk) {   // ← New condition (this is the replacement)
     shouldSell = true;
     sellReason = `Hard Stop ${(pos.buyAsk*100).toFixed(2)}→${(ask*100).toFixed(2)}¢`;
   }
