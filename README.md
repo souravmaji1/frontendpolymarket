@@ -81,9 +81,68 @@ root@FXVPS160764:~/frontendpolymarket#
 
 PS D:\tradepolymarket> 
 
+═════
+  FINAL TRADE REPORT
+════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+  #     Time          Type        Outcome                   Shares     Buy¢    Sell¢    Cost($)    Proceeds     P&L($)    Balance    Latency  Reason                          
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  1     7:11:16 PM    BUY         Taylor Fritz              1.2500    80.00        —     1.0000           —          —    $9.0000      981ms  Buy zone hit                    
+  2     7:11:16 PM    SELL LOSS   Taylor Fritz              1.2500    80.00    79.00          —      0.9875    -0.0125    $9.9875      988ms  ConsecStop 3 ticks              
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  SUMMARY
+  Final Balance : $9.9875   (started $10)
+  Total Cost    : -$1.0000
+  Total Proceeds: +$0.9875
+  Realized P&L  : $-0.0125
+  Trades        : 2 total  (1 buys / 1 sells)
+  Win Rate      : 0.0%  (0W / 1L)
+  Avg Win       : +$--
+  Avg Loss      : $-0.0125
+  Avg WS Lat    : 990ms
+  Runtime       : 79:12
+════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+PS D:\tradepolymarket> 
+
 
 atp-sonego-basilas-2026-06-14
 
-node newtwo.js atp-sonego-basilas-2026-06-14 --buyLow=80 --buyHigh=80 --sellLow=89 --sellHigh=95 --stopLoss=80 --slippage=1 --cooldown=0
+node newtwo.js atp-mensik-mannari-2026-06-15 --buyLow=80 --buyHigh=80 --sellLow=89 --sellHigh=95 --stopLoss=80  --cooldown=0
 
 node latest.js atp-shelton-fritz-2026-06-14 --buyLow=80 --buyHigh=80 --sellLow=89 --sellHigh=95 --cooldown=0 --stopTicks=3 --maxDips=5 --hardStop=5 --trailActivate=3 --trailDrop=1.5 --maxHold=0 --reentryDip=2
+
+
+  Shutting down...
+
+══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+  FINAL TRADE REPORT
+══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+  ALL TRADES (chronological)
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  #     TYPE   OUTCOME      BUY_RAW¢   BUY_EMA¢   SELL_RAW¢  SELL_EMA¢  SHARES       COST($)      PROCEEDS($) P&L($)   TIME / REASON
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  1     BUY    Terence Atm  84.0000    84.0000    84.0000    84.0000    1.190476     1.000000     1.000000    +0.000000 13:50:26.380
+         └─ sold@13:50:26.654 | Buy zone confirmed (3 ticks) EMA:84.0000¢ Raw:84.0000¢
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  SUMMARY
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Final Balance    : $10.000000  (started $10)
+  Total Cost       : -$1.000000
+  Total Proceeds   : +$1.000000
+  Realized P&L     : +0.000000
+  Round Trips      : 1 total  (1 buys paired / 1 sells)
+  Open Positions   : 0
+  Win Rate         : 100.0%  (1W / 0L)
+  Avg Win          : +$0.000000
+  Avg Loss         : --
+  Best Trade       : +$0.000000  (#1 Terence Atmane)
+  Worst Trade      : $0.000000  (#1 Terence Atmane)
+  Avg WS Latency   : 333ms
+  Runtime          : 58:57
+  EMA Alpha        : 0.25
+  Confirm Ticks    : 3
+  Price Threshold  : 0.100¢
+══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
