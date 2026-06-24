@@ -1,69 +1,47 @@
-/**
- * POLYBOT — Multi-Worker Edition
- * ─────────────────────────────────────────────────────────────────────────────
- * Architecture:
- *   Main thread   → trading logic, reporting, SharedArrayBuffer writes
- *   Worker 1 & 2  → independent WS + REST feeds, post prices to main via port
- *
- * Price Bus (SharedArrayBuffer):
- *   For each asset slot (max 8):
- *     [ask_float64, bid_float64, timestamp_float64]  → 3 × 8 bytes = 24 bytes/asset
- *   Workers write → Main reads each tick cycle
- *
- * Re-entry fix:
- *   After a SELL, immediately re-evaluate current cached price.
- *   If still in buy zone → buy in the same tick (no cooldown gap).
- *
- * Momentum filter:
- *   Tracks last 3 ask ticks per asset.  Only buys if ask is RISING into zone
- *   (avoids catching a falling knife at the top of the range).
- * ─────────────────────────────────────────────────────────────────────────────
- */
-
 'use strict';
 
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 const WebSocket = require('ws');
 
-// ─── WORKER CODE (runs inside Worker threads) ────────────────────────────────
 if (!isMainThread) {
   const { workerId, clobTokenIds, tokenToOutcome, sharedBuffer, slotMap } = workerData;
 
-  const SLOTS = 3; // ask, bid, ts  per asset
+  const SLOTS = 3;
   const f64   = new Float64Array(sharedBuffer);
 
-  function writePrice(assetId, ask, bid) {
+  function writeSharedBuffer(assetId, ask, bid) {
     const slot = slotMap[assetId];
     if (slot === undefined) return;
     const base = slot * SLOTS;
-    // Non-atomic float64 writes are fine — we own our slots
     f64[base + 0] = ask;
     f64[base + 1] = bid;
     f64[base + 2] = Date.now();
-    // Also notify main thread with full context
-    parentPort.postMessage({ type: 'tick', assetId, ask, bid, ts: Date.now(), workerId });
   }
 
-  // ── REST poll ──
+  function postTick(assetId, ask, bid, latencyMs) {
+    parentPort.postMessage({ type: 'tick', assetId, ask, bid, latencyMs, workerId });
+  }
+
   async function poll() {
     for (const id of clobTokenIds) {
       try {
+        const t0 = Date.now();
         const r = await fetch(`https://clob.polymarket.com/price?token_id=${id}`);
         if (!r.ok) continue;
         const d = await r.json();
         const mid = parseFloat(d.price || 0);
-        if (mid > 0) {
-          const slot = slotMap[id];
-          const base = slot * SLOTS;
-          const prevAsk = f64[base + 0];
-          writePrice(id, mid, prevAsk > 0 ? prevAsk * 0.999 : 0); // synthetic bid
-        }
+        if (mid <= 0) continue;
+        const slot = slotMap[id];
+        const prevAsk = f64[slot * SLOTS];
+        const latencyMs = Date.now() - t0;
+        writeSharedBuffer(id, mid, prevAsk > 0 ? prevAsk * 0.999 : 0);
+        postTick(id, mid, prevAsk > 0 ? prevAsk * 0.999 : 0, latencyMs);
       } catch {}
     }
   }
-  setInterval(poll, 3000 + workerId * 700); // stagger polls between workers
 
-  // ── WebSocket ──
+  setInterval(poll, 3000 + workerId * 700);
+
   function connect() {
     const ws = new WebSocket('wss://ws-subscriptions-clob.polymarket.com/ws/market');
 
@@ -77,14 +55,21 @@ if (!isMainThread) {
 
     ws.on('message', (raw) => {
       try {
+        const recvTime = Date.now();
         const msg = JSON.parse(raw.toString());
-        const changes = msg.price_changes || [];
-        for (const c of changes) {
+        const topTs = msg.timestamp ? parseInt(msg.timestamp) : null;
+        for (const c of (msg.price_changes || [])) {
           const assetId = c.asset_id;
           if (!assetId || slotMap[assetId] === undefined) continue;
           const ask = parseFloat(c.best_ask || 0);
           const bid = parseFloat(c.best_bid || 0);
-          if (ask > 0 || bid > 0) writePrice(assetId, ask || 0, bid || 0);
+          if (ask <= 0 && bid <= 0) continue;
+          const serverTs = c.timestamp ? parseInt(c.timestamp) : topTs;
+          const lat = (serverTs && Math.abs(recvTime - serverTs) < 30000)
+            ? recvTime - serverTs
+            : null;
+          writeSharedBuffer(assetId, ask || 0, bid || 0);
+          postTick(assetId, ask || 0, bid || 0, lat);
         }
       } catch {}
     });
@@ -94,15 +79,10 @@ if (!isMainThread) {
   }
 
   connect();
-
-  // Keep worker alive
   setInterval(() => {}, 60000);
-  return; // ← worker exits here; everything below is main-thread only
+  return;
 }
 
-// ─── MAIN THREAD ─────────────────────────────────────────────────────────────
-
-// ── Arg parsing ──
 const slug = process.argv[2] || 'atp-montsi-donski-2026-06-06';
 
 function parseArgs() {
@@ -114,49 +94,47 @@ function parseArgs() {
   }
   return parsed;
 }
+
 const args = parseArgs();
 function getArg(k, def) { return args[k] !== undefined ? parseFloat(args[k]) : def; }
 
 const config = {
-  paperBalance:      getArg('balance',  10),
-  buyZoneLow:        getArg('buyLow',   0.62) / 100,
-  buyZoneHigh:       getArg('buyHigh',  0.64) / 100,
-  sellZoneLow:       getArg('sellLow',  0.68) / 100,
-  sellZoneHigh:      getArg('sellHigh', 0.69) / 100,
-  stopLossBuffer:    getArg('stopBuf',  0.005),  // sell if ask drops buyAsk - stopBuf
-  numWorkers:        Math.max(1, Math.min(4, getArg('workers', 2))),
-  momentumWindow:    3,           // ticks to track for momentum
-  maxPositionsPerAsset: 1,        // only 1 position per outcome at a time
+  paperBalance:   getArg('balance',  10),
+  buyZoneLow:     getArg('buyLow',   0.62) / 100,
+  buyZoneHigh:    getArg('buyHigh',  0.64) / 100,
+  sellZoneLow:    getArg('sellLow',  0.68) / 100,
+  sellZoneHigh:   getArg('sellHigh', 0.69) / 100,
+  stopLossBuffer: getArg('stopBuf',  0.005),
+  numWorkers:     Math.max(1, Math.min(4, getArg('workers', 2))),
+  momentumWindow: 3,
 };
 
-// ── State ──
-let running       = true;
-let paperBalance  = config.paperBalance;
-let positions     = {};          // assetId → { shares, buyAsk, outcomeName, peakAsk }
-let lastAsk       = {};
-let lastBid       = {};
-let lastSellTime  = {};
-let askHistory    = {};          // assetId → [ask, ask, ask] rolling window
-let trades        = [];
-let tradeCounter  = 0;
-let startTime     = Date.now();
-let wsLatencies   = [];
-let tickCounts    = {};          // assetId → number
+let running      = true;
+let paperBalance = config.paperBalance;
+let positions    = {};
+let lastAsk      = {};
+let lastBid      = {};
+let lastSellTime = {};
+let askHistory   = {};
+let trades       = [];
+let tradeCounter = 0;
+let startTime    = Date.now();
+let wsLatencies  = [];
+let tickCounts   = {};
 let tokenToOutcome = {};
-let clobTokenIds  = [];
+let clobTokenIds   = [];
 
 const NUM_WORKER_SLOTS = 8;
-const SLOTS_PER_ASSET  = 3; // ask, bid, ts
+const SLOTS_PER_ASSET  = 3;
 const sharedBuffer = new SharedArrayBuffer(NUM_WORKER_SLOTS * SLOTS_PER_ASSET * 8);
 const f64 = new Float64Array(sharedBuffer);
-let slotMap = {}; // assetId → slot index
+let slotMap = {};
 
-// ── Colors ──
 const C = {
-  reset:  '\x1b[0m',  grey:    '\x1b[90m', white: '\x1b[37m',
-  green:  '\x1b[32m', red:     '\x1b[31m', yellow:'\x1b[33m',
-  cyan:   '\x1b[36m', magenta: '\x1b[35m', bold:  '\x1b[1m',
-  blue:   '\x1b[34m',
+  reset:   '\x1b[0m',  grey:    '\x1b[90m', white:   '\x1b[37m',
+  green:   '\x1b[32m', red:     '\x1b[31m', yellow:  '\x1b[33m',
+  cyan:    '\x1b[36m', magenta: '\x1b[35m', bold:    '\x1b[1m',
+  blue:    '\x1b[34m',
 };
 
 function log(text, type = 'info') {
@@ -170,7 +148,6 @@ function pad(str, len, right = false) {
   return right ? s.padStart(len) : s.padEnd(len);
 }
 
-// ── Live summary ──
 function printLiveSummary() {
   const realizedPnL = trades.filter(t => t.type === 'SELL').reduce((s, t) => s + t.pnl, 0);
   const wins   = trades.filter(t => t.type === 'SELL' && t.pnl >= 0).length;
@@ -183,7 +160,6 @@ function printLiveSummary() {
   const avgLat = wsLatencies.length > 0
     ? (wsLatencies.slice(-20).reduce((a, b) => a + b, 0) / Math.min(wsLatencies.length, 20)).toFixed(0) + 'ms'
     : '--';
-
   const totalTicks = Object.values(tickCounts).reduce((a, b) => a + b, 0);
 
   console.log(`\n${C.grey}─────────────────────────────────────────${C.reset}`);
@@ -198,7 +174,6 @@ function printLiveSummary() {
   console.log(`${C.grey}─────────────────────────────────────────${C.reset}\n`);
 }
 
-// ── Final report ──
 function printFinalReport() {
   const elapsed = Math.floor((Date.now() - startTime) / 1000);
   const mm = String(Math.floor(elapsed / 60)).padStart(2, '0');
@@ -209,7 +184,7 @@ function printFinalReport() {
   console.log(`${C.yellow}${'═'.repeat(120)}${C.reset}`);
 
   const hdr = [
-    pad('#',    4), pad('Time', 10), pad('Type', 10), pad('Outcome', 18),
+    pad('#', 4), pad('Time', 10), pad('Type', 10), pad('Outcome', 18),
     pad('Shares', 10, true), pad('Buy¢', 7, true), pad('Sell¢', 7, true),
     pad('Cost', 9, true), pad('Proceeds', 10, true), pad('P&L', 9, true),
     pad('Balance', 10, true), pad('Latency', 9, true), pad('Reason', 22),
@@ -229,11 +204,8 @@ function printFinalReport() {
       typeLabel = t.pnl >= 0 ? 'SELL WIN' : 'SELL LOSS';
       runningBal += t.proceeds;
     }
-
     const row = [
-      pad(t.id, 4),
-      pad(t.time, 10),
-      pad(typeLabel, 10),
+      pad(t.id, 4), pad(t.time, 10), pad(typeLabel, 10),
       pad(t.outcome.substring(0, 17), 18),
       pad(t.shares.toFixed(4), 10, true),
       pad((t.buyAsk * 100).toFixed(2), 7, true),
@@ -248,16 +220,17 @@ function printFinalReport() {
     console.log(`${color}  ${row}${C.reset}`);
   }
 
-  const sellTrades   = trades.filter(t => t.type === 'SELL');
-  const realizedPnL  = sellTrades.reduce((s, t) => s + t.pnl, 0);
-  const totalCost    = trades.filter(t => t.type === 'BUY').reduce((s, t) => s + t.cost, 0);
-  const totalProc    = sellTrades.reduce((s, t) => s + t.proceeds, 0);
-  const wins         = sellTrades.filter(t => t.pnl >= 0).length;
-  const losses       = sellTrades.filter(t => t.pnl < 0).length;
-  const winRate      = (wins + losses) > 0 ? ((wins / (wins + losses)) * 100).toFixed(1) + '%' : '--';
-  const avgWin       = wins   > 0 ? (sellTrades.filter(t=>t.pnl>=0).reduce((s,t)=>s+t.pnl,0)/wins).toFixed(4)  : '--';
-  const avgLoss      = losses > 0 ? (sellTrades.filter(t=>t.pnl<0).reduce((s,t)=>s+t.pnl,0)/losses).toFixed(4) : '--';
-  const avgLat       = wsLatencies.length > 0 ? (wsLatencies.reduce((a,b)=>a+b,0)/wsLatencies.length).toFixed(0)+'ms' : '--';
+  const sellTrades  = trades.filter(t => t.type === 'SELL');
+  const realizedPnL = sellTrades.reduce((s, t) => s + t.pnl, 0);
+  const totalCost   = trades.filter(t => t.type === 'BUY').reduce((s, t) => s + t.cost, 0);
+  const totalProc   = sellTrades.reduce((s, t) => s + t.proceeds, 0);
+  const wins        = sellTrades.filter(t => t.pnl >= 0).length;
+  const losses      = sellTrades.filter(t => t.pnl <  0).length;
+  const winRate     = (wins + losses) > 0 ? ((wins / (wins + losses)) * 100).toFixed(1) + '%' : '--';
+  const avgWin      = wins   > 0 ? (sellTrades.filter(t => t.pnl >= 0).reduce((s, t) => s + t.pnl, 0) / wins).toFixed(4)  : '--';
+  const avgLoss     = losses > 0 ? (sellTrades.filter(t => t.pnl <  0).reduce((s, t) => s + t.pnl, 0) / losses).toFixed(4) : '--';
+  const avgLat      = wsLatencies.length > 0
+    ? (wsLatencies.reduce((a, b) => a + b, 0) / wsLatencies.length).toFixed(0) + 'ms' : '--';
 
   console.log(`${C.grey}  ${'─'.repeat(118)}${C.reset}`);
   console.log(`\n${C.yellow}  SUMMARY${C.reset}`);
@@ -265,7 +238,7 @@ function printFinalReport() {
   console.log(`${C.white}  Total Cost     : ${C.red}-$${totalCost.toFixed(4)}${C.reset}`);
   console.log(`${C.white}  Total Proceeds : ${C.green}+$${totalProc.toFixed(4)}${C.reset}`);
   console.log(`${C.white}  Realized P&L   : ${realizedPnL >= 0 ? C.green : C.red}${realizedPnL >= 0 ? '+' : ''}$${realizedPnL.toFixed(4)}${C.reset}`);
-  console.log(`${C.white}  Trades         : ${trades.length}  (${trades.filter(t=>t.type==='BUY').length} buys / ${sellTrades.length} sells)`);
+  console.log(`${C.white}  Trades         : ${trades.length}  (${trades.filter(t => t.type === 'BUY').length} buys / ${sellTrades.length} sells)`);
   console.log(`${C.white}  Win Rate       : ${C.yellow}${winRate}${C.reset}  (${wins}W / ${losses}L)`);
   console.log(`${C.white}  Avg Win        : ${C.green}+$${avgWin}${C.reset}`);
   console.log(`${C.white}  Avg Loss       : ${C.red}$${avgLoss}${C.reset}`);
@@ -274,16 +247,10 @@ function printFinalReport() {
   console.log(`${C.yellow}${'═'.repeat(120)}${C.reset}\n`);
 }
 
-// ─── MOMENTUM HELPER ─────────────────────────────────────────────────────────
-/**
- * Returns true if price is rising into the buy zone.
- * Requires at least 2 ticks where each was >= the previous.
- */
 function isRisingIntoZone(assetId, ask) {
   const hist = askHistory[assetId] || [];
-  if (hist.length < 2) return true; // not enough data — allow optimistically
-  const prev = hist[hist.length - 1];
-  return ask >= prev; // current tick must not be falling
+  if (hist.length < 2) return true;
+  return ask >= hist[hist.length - 1];
 }
 
 function recordAsk(assetId, ask) {
@@ -292,17 +259,14 @@ function recordAsk(assetId, ask) {
   if (askHistory[assetId].length > config.momentumWindow) askHistory[assetId].shift();
 }
 
-// ─── TRADING LOGIC ───────────────────────────────────────────────────────────
-
 function tryBuy(assetId, outcomeName, ask, latencyMs) {
   if (positions[assetId]) return;
   if (!ask || ask <= 0) return;
   if (paperBalance < 1.0) return;
 
   if (ask >= config.buyZoneLow && ask <= config.buyZoneHigh) {
-    // ── Momentum filter: only buy if price is stable/rising into zone ──
     if (!isRisingIntoZone(assetId, ask)) {
-      log(`SKIP BUY ${outcomeName} @ ${(ask*100).toFixed(2)}¢ — falling into zone`, 'info');
+      log(`SKIP BUY ${outcomeName} @ ${(ask * 100).toFixed(2)}¢ — falling into zone`, 'info');
       return;
     }
 
@@ -321,16 +285,13 @@ function tryBuy(assetId, outcomeName, ask, latencyMs) {
     });
 
     log(
-      `BUY  ${outcomeName} | ${(ask*100).toFixed(2)}¢ | ${shares.toFixed(4)}sh | lat:${latencyMs??'--'}ms | bal $${paperBalance.toFixed(2)}`,
+      `BUY  ${outcomeName} | ${(ask * 100).toFixed(2)}¢ | ${shares.toFixed(4)}sh | lat:${latencyMs != null ? latencyMs + 'ms' : '--'} | bal $${paperBalance.toFixed(2)}`,
       'buy'
     );
     printLiveSummary();
   }
 }
 
-/**
- * Returns true if a sell was executed (so caller can immediately re-evaluate buy).
- */
 function trySell(assetId, ask, latencyMs) {
   const pos = positions[assetId];
   if (!pos || !ask || ask <= 0) return false;
@@ -339,22 +300,19 @@ function trySell(assetId, ask, latencyMs) {
   let shouldSell = false;
   let sellReason = '';
 
-  // Hard stop: price dropped to or below buy price minus buffer
   if (ask <= pos.buyAsk - config.stopLossBuffer) {
     shouldSell = true;
-    sellReason = `StopLoss ${(pos.buyAsk*100).toFixed(2)}→${(ask*100).toFixed(2)}¢`;
+    sellReason = `StopLoss ${(pos.buyAsk * 100).toFixed(2)}→${(ask * 100).toFixed(2)}¢`;
   }
 
-  // Target zone
   if (!shouldSell && ask >= config.sellZoneLow && ask <= config.sellZoneHigh) {
     shouldSell = true;
-    sellReason = `Target ${(ask*100).toFixed(2)}¢`;
+    sellReason = `Target ${(ask * 100).toFixed(2)}¢`;
   }
 
-  // Trailing stop: if peaked well above sell zone and dropped back into it — take profit early
   if (!shouldSell && pos.peakAsk > config.sellZoneHigh && ask >= config.sellZoneLow) {
     shouldSell = true;
-    sellReason = `Trail ${(pos.peakAsk*100).toFixed(2)}→${(ask*100).toFixed(2)}¢`;
+    sellReason = `Trail ${(pos.peakAsk * 100).toFixed(2)}→${(ask * 100).toFixed(2)}¢`;
   }
 
   if (!shouldSell) return false;
@@ -377,20 +335,13 @@ function trySell(assetId, ask, latencyMs) {
   const type = pnl >= 0 ? 'sell_win' : 'sell_loss';
   const icon = pnl >= 0 ? 'SELL WIN ' : 'SELL LOSS';
   log(
-    `${icon} ${pos.outcomeName} | ${(pos.buyAsk*100).toFixed(2)}→${(ask*100).toFixed(2)}¢ | P&L ${pnl>=0?'+':''}$${pnl.toFixed(4)} | lat:${latencyMs??'--'}ms | bal $${paperBalance.toFixed(2)} | ${sellReason}`,
+    `${icon} ${pos.outcomeName} | ${(pos.buyAsk * 100).toFixed(2)}→${(ask * 100).toFixed(2)}¢ | P&L ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)} | lat:${latencyMs != null ? latencyMs + 'ms' : '--'} | bal $${paperBalance.toFixed(2)} | ${sellReason}`,
     type
   );
   printLiveSummary();
   return true;
 }
 
-/**
- * Core tick handler.
- * ─────────────────────────────────────────────────────
- * KEY FIX: After a sell, IMMEDIATELY re-check for buy on the SAME price.
- * This is what catches the "sold at 80, price rockets to 81, missed re-entry" bug:
- * if price is still 80 after sell and 80 is in buy zone — we buy back right now.
- */
 function processTick(assetId, rawAsk, rawBid, source, latencyMs) {
   if (latencyMs != null && latencyMs >= 0 && latencyMs < 30000) wsLatencies.push(latencyMs);
 
@@ -404,7 +355,7 @@ function processTick(assetId, rawAsk, rawBid, source, latencyMs) {
   const outcomeName = tokenToOutcome[assetId] || assetId.slice(0, 8);
 
   log(
-    `[W${source}] ${outcomeName} | Ask:${ask > 0 ? (ask*100).toFixed(2)+'¢' : 'N/A'} | Bid:${bid > 0 ? (bid*100).toFixed(2)+'¢' : 'N/A'} | lat:${latencyMs??'--'}ms`,
+    `[W${source}] ${outcomeName} | Ask:${ask > 0 ? (ask * 100).toFixed(2) + '¢' : 'N/A'} | Bid:${bid > 0 ? (bid * 100).toFixed(2) + '¢' : 'N/A'} | lat:${latencyMs != null ? latencyMs + 'ms' : '--'}`,
     'info'
   );
 
@@ -412,9 +363,6 @@ function processTick(assetId, rawAsk, rawBid, source, latencyMs) {
   if (hadPosition) {
     const sold = trySell(assetId, ask, latencyMs);
     if (sold) {
-      // ── RE-ENTRY FIX ──
-      // Immediately try to buy back at the same price.
-      // If price is still in zone we catch the continuation move instantly.
       tryBuy(assetId, outcomeName, ask, latencyMs);
       return;
     }
@@ -422,8 +370,6 @@ function processTick(assetId, rawAsk, rawBid, source, latencyMs) {
     tryBuy(assetId, outcomeName, ask, latencyMs);
   }
 }
-
-// ─── WORKER SPAWNER ──────────────────────────────────────────────────────────
 
 function spawnWorkers() {
   for (let w = 0; w < config.numWorkers; w++) {
@@ -440,23 +386,20 @@ function spawnWorkers() {
     worker.on('message', (msg) => {
       if (!running) return;
       if (msg.type === 'tick') {
-        const latencyMs = Date.now() - msg.ts;
-        processTick(msg.assetId, msg.ask, msg.bid, msg.workerId, latencyMs);
+        processTick(msg.assetId, msg.ask, msg.bid, msg.workerId, msg.latencyMs);
       }
     });
 
-    worker.on('error', (err) => log(`Worker ${w+1} error: ${err.message}`, 'warn'));
+    worker.on('error', (err) => log(`Worker ${w + 1} error: ${err.message}`, 'warn'));
     worker.on('exit',  (code) => {
       if (!running) return;
-      log(`Worker ${w+1} exited (${code}), restarting...`, 'warn');
+      log(`Worker ${w + 1} exited (${code}), restarting...`, 'warn');
       setTimeout(() => spawnWorkers(), 3000);
     });
 
     log(`Worker ${w + 1} started`, 'info');
   }
 }
-
-// ─── INIT ─────────────────────────────────────────────────────────────────────
 
 async function init() {
   log(`Fetching market: ${slug}`, 'info');
@@ -495,11 +438,11 @@ async function init() {
     log(`Assets    : ${clobTokenIds.length} token(s)`, 'info');
     log(`Workers   : ${config.numWorkers}`, 'info');
     log(
-      `Prices    : ${prices.map((p, i) => `${outcomes[i]||i}: ${(parseFloat(p)*100).toFixed(2)}¢`).join(' | ')}`,
+      `Prices    : ${prices.map((p, i) => `${outcomes[i] || i}: ${(parseFloat(p) * 100).toFixed(2)}¢`).join(' | ')}`,
       'info'
     );
     log(
-      `Strategy  : BUY ${(config.buyZoneLow*100).toFixed(2)}–${(config.buyZoneHigh*100).toFixed(2)}¢ | SELL ${(config.sellZoneLow*100).toFixed(2)}–${(config.sellZoneHigh*100).toFixed(2)}¢ | StopBuf ${(config.stopLossBuffer*100).toFixed(2)}¢`,
+      `Strategy  : BUY ${(config.buyZoneLow * 100).toFixed(2)}–${(config.buyZoneHigh * 100).toFixed(2)}¢ | SELL ${(config.sellZoneLow * 100).toFixed(2)}–${(config.sellZoneHigh * 100).toFixed(2)}¢ | StopBuf ${(config.stopLossBuffer * 100).toFixed(2)}¢`,
       'info'
     );
     log(`Balance   : $${config.paperBalance}`, 'info');
@@ -511,8 +454,6 @@ async function init() {
   }
 }
 
-// ─── GRACEFUL SHUTDOWN ────────────────────────────────────────────────────────
-
 function stop() {
   running = false;
   log('Stopping...', 'info');
@@ -522,8 +463,6 @@ function stop() {
 
 process.on('SIGINT',  stop);
 process.on('SIGTERM', stop);
-
-// ─── BANNER ──────────────────────────────────────────────────────────────────
 
 console.log('\x1b[33m');
 console.log('  ██████╗  ██████╗ ██╗  ██╗   ██╗██████╗  ██████╗ ████████╗');
@@ -535,9 +474,9 @@ console.log('  ╚═╝      ╚═════╝ ╚══════╝╚�
 console.log('                              MULTI-WORKER EDITION');
 console.log('\x1b[0m');
 console.log(`\x1b[90m  Slug:      ${slug}\x1b[0m`);
-console.log(`\x1b[90m  Buy zone:  ${(config.buyZoneLow*100).toFixed(2)}–${(config.buyZoneHigh*100).toFixed(2)}¢\x1b[0m`);
-console.log(`\x1b[90m  Sell zone: ${(config.sellZoneLow*100).toFixed(2)}–${(config.sellZoneHigh*100).toFixed(2)}¢\x1b[0m`);
-console.log(`\x1b[90m  StopBuf:   ${(config.stopLossBuffer*100).toFixed(2)}¢\x1b[0m`);
+console.log(`\x1b[90m  Buy zone:  ${(config.buyZoneLow * 100).toFixed(2)}–${(config.buyZoneHigh * 100).toFixed(2)}¢\x1b[0m`);
+console.log(`\x1b[90m  Sell zone: ${(config.sellZoneLow * 100).toFixed(2)}–${(config.sellZoneHigh * 100).toFixed(2)}¢\x1b[0m`);
+console.log(`\x1b[90m  StopBuf:   ${(config.stopLossBuffer * 100).toFixed(2)}¢\x1b[0m`);
 console.log(`\x1b[90m  Balance:   $${config.paperBalance}\x1b[0m`);
 console.log(`\x1b[90m  Workers:   ${config.numWorkers}\x1b[0m\n`);
 
