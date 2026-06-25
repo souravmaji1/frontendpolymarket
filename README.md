@@ -9,4 +9,4 @@ node newthree.js itf-sawashi-yodpetc-2026-06-23 --wsCount=3 --buyLow=0.80 --buyH
 
 node newfour.js atp-mcdona-passaro-2026-06-24 --buyLow=80 --buyHigh=80 --sellLow=85 --sellHigh=94 --workers=2
 
-node newfive.js atp-mcdona-passaro-2026-06-24 --buyLow=80 --buyHigh=80 --sellLow=85 --sellHigh=94 --workers=2
+node newfive.js atp-nedic-gima-2026-06-24 --buyLow=80 --buyHigh=80 --sellLow=85 --sellHigh=94 --workers=2
